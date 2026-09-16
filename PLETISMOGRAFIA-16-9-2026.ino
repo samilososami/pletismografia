@@ -1,0 +1,3486 @@
+#include <Arduino.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <LittleFS.h>
+#include <Preferences.h>
+#include <WebServer.h>
+#include <WiFi.h>
+#include <ctype.h>
+#include <esp_timer.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <math.h>
+
+// Keyestudio KS5016 ESP32 PLUS / ESP32-WROOM-32.
+// Prototipo experimental: no es un dispositivo medico.
+
+constexpr uint8_t SENSOR_PIN = 34;  // ADC1, entrada solamente, compatible con WiFi.
+constexpr uint8_t MOTOR_PIN = 25;    // D3 / GPIO25
+constexpr uint32_t SAMPLE_RATE_HZ = 50;
+constexpr uint32_t SAMPLE_PERIOD_MS = 1000 / SAMPLE_RATE_HZ;
+constexpr uint16_t ADC_MAX_VALUE = 4095;
+
+// ====================== PARAMETROS AJUSTABLES ======================
+// Adquisicion: ocho conversiones y media recortada (descarta min y max).
+constexpr uint8_t ADC_OVERSAMPLES = 8;
+// Banda PPG: los coeficientes de los biquads inferiores son 0,5-5 Hz a 50 Hz.
+constexpr float MIN_SIGNAL_AMPLITUDE_ADC = 4.0f;
+constexpr float CALIBRATION_NOISE_MULTIPLIER = 3.0f;
+constexpr float ADAPTIVE_THRESHOLD_FRACTION = 0.38f;
+constexpr float IBI_OUTLIER_FRACTION = 0.28f;
+constexpr uint32_t REFRACTORY_MS = 300;
+constexpr uint32_t MAX_IBI_MS = 2000;  // 30 BPM para un intervalo individual.
+constexpr uint32_t MAX_PEAK_GAP_MS = 4500;
+constexpr uint32_t BPM_HOLD_MS = 6000;
+constexpr uint32_t DETECTOR_SETTLE_MS = 2000;
+constexpr uint8_t MIN_INTERVALS_FOR_BPM = 4;
+constexpr uint8_t MIN_INTERVALS_FOR_AVERAGE = 8;
+// Respiracion derivada de tres modulaciones de la misma PPG (RIIV, RIAV, RIFV).
+// Ventanas de 32-60 s a 5 Hz, como las empleadas en validaciones de RR por PPG.
+constexpr uint8_t RESPIRATION_SAMPLE_HZ = 5;
+constexpr uint8_t RESPIRATION_DOWNSAMPLE = SAMPLE_RATE_HZ / RESPIRATION_SAMPLE_HZ;
+constexpr size_t RESPIRATION_WINDOW = 60 * RESPIRATION_SAMPLE_HZ;
+constexpr size_t RESPIRATION_MIN_SAMPLES = 32 * RESPIRATION_SAMPLE_HZ;
+constexpr float RESPIRATION_MIN_RPM = 6.0f;
+constexpr float RESPIRATION_MAX_RPM = 36.0f;
+constexpr float RESPIRATION_STEP_RPM = 0.5f;
+constexpr size_t RESPIRATION_FREQUENCIES = 61;
+constexpr uint32_t DERIVED_UPDATE_MS = 5000;
+constexpr uint32_t STRESS_WINDOW_MS = 60000;
+constexpr uint32_t STRESS_MIN_WINDOW_MS = 30000;
+constexpr uint32_t DERIVED_RESULT_GRACE_MS = 15000;
+constexpr size_t PRV_HISTORY = 220;
+// ===================================================================
+
+constexpr char FIRMWARE_VERSION[] = "leire-tdr-web-1.4.1-oled32";
+
+constexpr char AP_SSID[] = "fotopletismografia";
+constexpr char AP_PASSWORD[] = "12345678";
+constexpr char LOG_PATH[] = "/calibration.log";
+constexpr char LOG_OLD_PATH[] = "/calibration.previous.log";
+constexpr size_t MAX_LOG_BYTES = 64 * 1024;
+
+constexpr uint32_t PREPARE_MS = 3000;
+constexpr uint32_t CALIBRATION_SAMPLE_MS = 10000;
+constexpr size_t CALIBRATION_CAPACITY = 510;
+constexpr size_t MIN_CALIBRATION_SAMPLES = 450;
+constexpr size_t SIGNAL_WINDOW = 100;  // 2 s para amplitud/umbral adaptativos.
+constexpr size_t IBI_HISTORY = 9;
+// Seis segundos de señal: suficiente para ver varios ciclos completos incluso
+// con un pulso lento. El navegador pide después únicamente las muestras nuevas.
+constexpr size_t GRAPH_HISTORY = 300;
+
+WebServer server(80);
+Preferences preferences;
+portMUX_TYPE stateMux = portMUX_INITIALIZER_UNLOCKED;
+
+struct Biquad {
+  float b0, b1, b2, a1, a2;
+  float x1 = 0, x2 = 0, y1 = 0, y2 = 0;
+
+  float process(float x) {
+    const float y = b0 * x + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2;
+    x2 = x1;
+    x1 = x;
+    y2 = y1;
+    y1 = y;
+    return y;
+  }
+
+  void reset() { x1 = x2 = y1 = y2 = 0; }
+};
+
+Biquad highPass{0.95654323f, -1.91308645f, 0.95654323f,
+                -1.91119707f, 0.91497583f};
+Biquad lowPass{0.06745527f, 0.13491055f, 0.06745527f,
+               -1.14298050f, 0.41280160f};
+
+enum class CalibrationPhase : uint8_t {
+  IDLE,
+  PREPARE_FINGER,
+  SAMPLE_FINGER,
+  PREPARE_NO_FINGER,
+  SAMPLE_NO_FINGER,
+  COMPLETE,
+  FAILED
+};
+
+struct PublicState {
+  uint16_t raw = 0;
+  float filtered = 0;
+  bool calibrated = false;
+  bool finger = false;
+  CalibrationPhase phase = CalibrationPhase::IDLE;
+  uint32_t phaseStartedMs = 0;
+  const char *calibrationMessage = "Inicia el mapeo del sensor.";
+  float bpmCurrent = 0;
+  float bpmAverage = 0;
+  bool bpmValid = false;
+  bool bpmAverageReady = false;
+  uint16_t beatCount = 0;
+  uint32_t pulseAccepted = 0;
+  uint32_t pulseRejected = 0;
+  uint32_t pulseRecovered = 0;
+  float quality = 0;
+  const char *qualityState = "no_finger";
+  float respirationRate = 0;
+  float respirationConfidence = 0;
+  float respirationWindowSeconds = 0;
+  bool respirationValid = false;
+  uint8_t respirationSources = 0;
+  float stressScore = 0;
+  float stressConfidence = 0;
+  float stressWindowSeconds = 0;
+  float rmssdMs = 0;
+  float baevskyStressIndex = 0;
+  bool stressValid = false;
+  bool stressUsesRespiration = false;
+  const char *stressState = "unavailable";
+  float threshold = 0;
+  bool peak = false;
+  uint32_t samples = 0;
+  uint32_t missed = 0;
+};
+
+PublicState publicState;
+// OLED 0.91 pulgadas ver1.6, SSD1306 128x32, BUS I2C de la STEAMakers.
+// Solo la tarea OLED utiliza Wire; nunca se transmite I2C dentro del sampler.
+constexpr uint8_t OLED_SDA = 21;
+constexpr uint8_t OLED_SCL = 22;
+constexpr uint32_t OLED_FRAME_MS = 50;  // 20 FPS, ~12 ms por imagen a 400 kHz.
+constexpr uint8_t OLED_ROTATION = 2;   // Giro de 180 grados para su montaje.
+Adafruit_SSD1306 oled(128, 32, &Wire, -1, 400000, 400000);
+bool oledReady = false;
+uint8_t oledAddress = 0;
+float graphRing[GRAPH_HISTORY] = {0};
+size_t graphIndex = 0;
+size_t graphCount = 0;
+volatile bool calibrationStartRequested = false;
+
+struct CalibrationLogEntry {
+  uint32_t uptimeMs;
+  const char *result;
+  uint16_t fingerCount;
+  uint16_t noFingerCount;
+  uint16_t fingerMedian;
+  uint16_t noFingerMedian;
+  uint16_t fingerMad;
+  uint16_t noFingerMad;
+  uint16_t fingerMin;
+  uint16_t fingerMax;
+  uint16_t noFingerMin;
+  uint16_t noFingerMax;
+  uint16_t difference;
+  uint16_t robustNoise;
+  uint32_t missed;
+};
+
+CalibrationLogEntry pendingLog{};
+volatile bool pendingLogReady = false;
+bool filesystemReady = false;
+bool preferencesReady = false;
+
+CalibrationPhase phase = CalibrationPhase::IDLE;
+uint32_t phaseStartedMs = 0;
+const char *phaseMessage = "Inicia el mapatge del sensor.";
+uint16_t fingerSamples[CALIBRATION_CAPACITY];
+uint16_t noFingerSamples[CALIBRATION_CAPACITY];
+uint16_t scratch[CALIBRATION_CAPACITY];
+size_t fingerSampleCount = 0;
+size_t noFingerSampleCount = 0;
+uint16_t fingerMedian = 0, noFingerMedian = 0;
+uint16_t fingerMad = 0, noFingerMad = 0;
+uint16_t fingerMin = ADC_MAX_VALUE, fingerMax = 0;
+uint16_t noFingerMin = ADC_MAX_VALUE, noFingerMax = 0;
+uint32_t missedAtCalibrationStart = 0;
+
+uint16_t rawValue = 0;
+float filteredValue = 0;
+float dcValue = 0;
+bool dcInitialized = false;
+bool calibrated = false;
+bool fingerPresent = false;
+bool fingerCandidate = false;
+uint32_t fingerCandidateSinceMs = 0;
+uint32_t fingerPresentSinceMs = 0;
+
+float signalRing[SIGNAL_WINDOW] = {0};
+size_t signalIndex = 0, signalCount = 0;
+float recentAmplitude = 0;
+float adaptiveThreshold = 0;
+float signalPeakLevel = 0;
+float noisePeakLevel = 0;
+float detectorPrevious2 = 0, detectorPrevious1 = 0;
+uint32_t detectorPrevious1Ms = 0;
+uint16_t polarityLearningSamples = 0;
+float positiveEnvelope = 0, negativeEnvelope = 0;
+int8_t signalPolarity = 1;
+float ppgValue = 0;
+bool peakThisSample = false;
+volatile bool serialPlotterEnabled = false;
+uint32_t lastPeakMs = 0;
+uint32_t lastReliablePulseMs = 0;
+uint32_t pulseAcceptedCount = 0;
+uint32_t pulseRejectedCount = 0;
+uint32_t pulseRecoveredCount = 0;
+uint16_t ibis[IBI_HISTORY] = {0};
+size_t ibiCount = 0, ibiIndex = 0;
+float bpmCurrent = 0, bpmAverage = 0, bpmSum = 0;
+uint16_t bpmAverageCount = 0;
+bool bpmValid = false, bpmAverageReady = false;
+float signalQuality = 0;
+
+// Tres series respiratorias a 5 Hz: intensidad (RIIV), amplitud (RIAV) y
+// frecuencia del pulso (RIFV). Se fusionan solo si sus espectros concuerdan.
+float respirationFeatures[3][RESPIRATION_WINDOW] = {{0}};
+float respirationWork[RESPIRATION_WINDOW] = {0};
+float respirationClean[RESPIRATION_WINDOW] = {0};
+float respirationSpectrum[RESPIRATION_FREQUENCIES] = {0};
+uint8_t respirationSignalQuality[RESPIRATION_WINDOW] = {0};
+size_t respirationIndex = 0, respirationCount = 0;
+uint8_t respirationDecimator = 0;
+float latestPulseAmplitude = 0;
+uint16_t latestAcceptedIbi = 0;
+float respirationRate = 0, respirationConfidence = 0;
+bool respirationValid = false;
+uint8_t respirationSources = 0;
+float respirationCandidate = 0;
+uint8_t respirationCandidateStreak = 0;
+uint32_t respirationLastSuccessMs = 0;
+uint32_t lastDerivedUpdateMs = 0, derivedStartedMs = 0;
+bool derivedCollecting = false;
+
+uint16_t prvIntervals[PRV_HISTORY] = {0};
+uint32_t prvTimes[PRV_HISTORY] = {0};
+size_t prvIndex = 0, prvCount = 0;
+float stressScore = 0, stressConfidence = 0;
+float rmssdMs = 0, baevskyStressIndex = 0;
+bool stressValid = false;
+bool stressUsesRespiration = false;
+uint32_t stressLastSuccessMs = 0;
+const char *stressState = "unavailable";
+
+uint32_t totalSamples = 0, missedSamples = 0;
+uint64_t lastSampleUs = 0;
+char serialCommand[24];
+size_t serialCommandLength = 0;
+
+// ====================== BIOFEEDBACK MOTOR ======================
+// Patron: 4 s continuo -> 7 s con pulsos de ~0,5 s -> 8 s continuo.
+constexpr uint32_t MOTOR_PHASE1_MS = 4000;
+constexpr uint32_t MOTOR_PHASE2_MS = 7000;
+constexpr uint32_t MOTOR_PHASE3_MS = 8000;
+constexpr uint32_t MOTOR_INTERVAL_MS = 1000;
+constexpr uint32_t MOTOR_PULSE_MS = 500;
+
+volatile bool breathingStartRequested = false;
+volatile bool breathingRunning = false;
+uint8_t breathingPhase = 0;
+uint32_t breathingStartedMs = 0;
+uint32_t breathingPhaseStartedMs = 0;
+bool motorOn = false;
+
+void setMotor(bool on) {
+  motorOn = on;
+  digitalWrite(MOTOR_PIN, on ? HIGH : LOW);
+}
+
+void startBreathingPattern(uint32_t now) {
+  breathingRunning = true;
+  breathingPhase = 1;
+  breathingStartedMs = now;
+  breathingPhaseStartedMs = now;
+  setMotor(true);
+}
+
+void stopBreathingPattern() {
+  breathingRunning = false;
+  breathingPhase = 0;
+  setMotor(false);
+}
+
+void updateBreathingPattern(uint32_t now) {
+  if (breathingStartRequested && !breathingRunning) {
+    breathingStartRequested = false;
+    startBreathingPattern(now);
+  }
+
+  if (!breathingRunning) return;
+
+  // Un reloj absoluto evita que las peticiones web acumulen retraso entre fases.
+  const uint32_t elapsed = now - breathingStartedMs;
+  if (elapsed >= MOTOR_PHASE1_MS + MOTOR_PHASE2_MS + MOTOR_PHASE3_MS) {
+    stopBreathingPattern();
+    return;
+  }
+  if (elapsed < MOTOR_PHASE1_MS) {
+    breathingPhase = 1;
+    breathingPhaseStartedMs = breathingStartedMs;
+    setMotor(true);
+  } else if (elapsed < MOTOR_PHASE1_MS + MOTOR_PHASE2_MS) {
+    breathingPhase = 2;
+    breathingPhaseStartedMs = breathingStartedMs + MOTOR_PHASE1_MS;
+    setMotor((elapsed - MOTOR_PHASE1_MS) % MOTOR_INTERVAL_MS < MOTOR_PULSE_MS);
+  } else {
+    breathingPhase = 3;
+    breathingPhaseStartedMs = breathingStartedMs + MOTOR_PHASE1_MS + MOTOR_PHASE2_MS;
+    setMotor(true);
+  }
+}
+
+// Generado por scripts/build_web.py. Edita los archivos de web/.
+// Fuentes DM Serif Display y DM Sans: SIL Open Font License (web/fonts/).
+#pragma once
+#include <Arduino.h>
+
+const char HTML_PAGE[] PROGMEM = R"HTML(<!doctype html>
+<html lang="ca">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#fcf9f4">
+  <meta name="description" content="Pols, respiracions per minut, estrès fisiològic estimat i respiració guiada 4–7–8.">
+  <title>Fotopletismografia · El teu pols, en temps real.</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 48 48'%3E%3Crect width='48' height='48' rx='12' fill='%230b4386'/%3E%3Cpath d='M6 31C14 31 13 12 19 12S23 29 28 24s4 7 14 7' fill='none' stroke='%23fcf9f4' stroke-width='3' stroke-linecap='round'/%3E%3C/svg%3E">
+  <style>@font-face {
+  font-family: 'Editorial';
+  src: url('data:font/woff2;base64,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') format('woff2');
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Interface';
+  src: url('data:font/woff2;base64,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') format('woff2');
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Interface';
+  src: url('data:font/woff2;base64,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') format('woff2');
+  font-style: normal;
+  font-weight: 500;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Interface';
+  src: url('data:font/woff2;base64,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') format('woff2');
+  font-style: normal;
+  font-weight: 600;
+  font-display: swap;
+}
+:root {
+  color-scheme: light;
+  --paper: #fcf9f4;
+  --sand: #f4eadb;
+  --blue: #0b4386;
+  --ink: #00377d;
+  --line: #d5b995;
+  --curve: #034ab1;
+  --white: #fffdfa;
+  --serif: 'Editorial', Georgia, serif;
+  --sans: 'Interface', Arial, sans-serif;
+}
+* {
+  box-sizing: border-box;
+}
+body {
+  margin: 0;
+  background: var(--paper);
+  color: var(--ink);
+  font-family: var(--sans);
+  font-size: 18px;
+  -webkit-font-smoothing: antialiased;
+}
+button,
+a {
+  -webkit-tap-highlight-color: transparent;
+}
+button {
+  font-family: inherit;
+}
+button,
+a {
+  touch-action: manipulation;
+}
+button:focus-visible,
+a:focus-visible {
+  outline: 3px solid var(--curve);
+  outline-offset: 5px;
+}
+button:disabled {
+  cursor: default;
+  opacity: 0.62;
+}
+a {
+  color: inherit;
+}
+svg {
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.7;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.icon-library {
+  position: absolute;
+  width: 0;
+  height: 0;
+  overflow: hidden;
+}
+.icon {
+  width: 32px;
+  height: 32px;
+  flex: none;
+}
+.app-shell {
+  max-width: 1680px;
+  margin: 0 auto;
+  padding: 16px 40px 18px;
+}
+.masthead {
+  min-height: 54px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  border-bottom: 1.5px solid var(--blue);
+  gap: 20px;
+}
+.wordmark {
+  font-family: var(--serif);
+  font-size: 32px;
+  line-height: 1.15;
+}
+.masthead-status {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 24px;
+}
+.session-summary {
+  display: flex;
+  align-items: center;
+  gap: 20px;
+  margin: 0;
+}
+.session-summary > div {
+  min-width: 72px;
+}
+.session-summary dt {
+  color: #55769e;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.09em;
+  line-height: 1.1;
+  text-transform: uppercase;
+}
+.session-summary dd {
+  margin: 2px 0 0;
+  font-size: 14px;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.1;
+  white-space: nowrap;
+}
+.session-summary dd span {
+  font-family: var(--serif);
+  font-size: 18px;
+}
+.connection {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  border-left: 1px solid #c8bfb2;
+  font-size: 16px;
+  padding-left: 24px;
+  white-space: nowrap;
+}
+.connection-dot {
+  height: 12px;
+  width: 12px;
+  border-radius: 50%;
+  background: var(--curve);
+  flex: none;
+}
+.connection[data-state='offline'] .connection-dot {
+  background: transparent;
+  border: 2px solid var(--blue);
+}
+h1,
+h2,
+h3,
+p {
+  margin: 0;
+}
+h1 {
+  font-family: var(--serif);
+  font-weight: 400;
+  font-size: clamp(54px, 5.5vw, 84px);
+  line-height: 1.1;
+  letter-spacing: -0.022em;
+  margin: 22px 0 25px;
+  color: var(--blue);
+}
+.metrics {
+  display: grid;
+  grid-template-columns: 25% 26% 21% 28%;
+  height: 140px;
+  margin-bottom: 20px;
+  align-items: stretch;
+}
+.metric {
+  position: relative;
+  padding: 0 20px 5px 62px;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+}
+.metric::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 7px;
+  bottom: 18px;
+  width: 1px;
+  background: #c8bfb2;
+}
+.metric:first-child {
+  padding-left: 18px;
+}
+.metric:first-child::before {
+  display: none;
+}
+.metric h2 {
+  font-size: 20px;
+  font-weight: 500;
+  line-height: 1.35;
+}
+.reading {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  white-space: nowrap;
+  line-height: 1;
+}
+.number {
+  font-family: var(--serif);
+  font-size: 66px;
+  font-weight: 400;
+  letter-spacing: -0.05em;
+  font-variant-numeric: lining-nums tabular-nums;
+  color: var(--blue);
+}
+.metric-current .number {
+  min-width: 1.03em;
+  font-size: 122px;
+  line-height: 0.91;
+}
+.unit {
+  font-size: 23px;
+  font-weight: 400;
+}
+.metric-current .unit {
+  font-size: 25px;
+  margin-left: 12px;
+}
+.percent {
+  font-family: var(--serif);
+  font-size: 56px;
+  letter-spacing: -0.05em;
+}
+.metric-stress .reading {
+  gap: 0;
+}
+.metric-respiration .reading,
+.metric-stress .reading {
+  padding-bottom: 2px;
+}
+.metric-detail {
+  color: #55769e;
+  font-size: 12px;
+  line-height: 1.25;
+  min-height: 15px;
+  white-space: nowrap;
+}
+.metric-finger {
+  flex-direction: row;
+  align-items: center;
+  justify-content: center;
+  padding: 8px 8px 0 58px;
+  gap: 24px;
+  font-size: 21px;
+  font-weight: 500;
+  line-height: 1.35;
+}
+.finger-icon {
+  width: 55px;
+  height: 100px;
+  flex: none;
+  stroke-width: 3;
+}
+.metric-finger[data-present='true'] .finger-icon {
+  fill: currentColor;
+}
+.metric-finger[data-present='false'] {
+  opacity: 0.65;
+}
+.signal-panel {
+  height: 304px;
+  background: var(--sand);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 12px 22px 12px;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.signal-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  min-height: 51px;
+  gap: 16px;
+}
+.signal-header h2 {
+  font-family: var(--serif);
+  font-size: 24px;
+  font-weight: 400;
+  line-height: 1.2;
+}
+.signal-header p {
+  font-size: 16px;
+  line-height: 1.6;
+}
+.legend {
+  display: inline-flex;
+  align-items: center;
+  gap: 12px;
+  border: 1px solid #e2cfb6;
+  background: var(--paper);
+  border-radius: 6px;
+  padding: 6px 14px;
+  font-size: 17px;
+  white-space: nowrap;
+  margin-top: 3px;
+}
+.legend i {
+  height: 3px;
+  width: 28px;
+  background: var(--curve);
+  border-radius: 2px;
+}
+.plot-area {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  border: 1px solid #fffdfa;
+  background-image:
+    linear-gradient(to right, #fffdfa 1px, transparent 1px),
+    linear-gradient(to bottom, #fffdfa 1px, transparent 1px);
+  background-size:
+    16.666666% 100%,
+    100% 16.666666%;
+}
+canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+.time-axis {
+  display: flex;
+  justify-content: space-between;
+  margin: 7px -5px 0;
+  font-size: 18px;
+  line-height: 1.25;
+}
+.controls-grid {
+  display: grid;
+  grid-template-columns: 45fr 54fr;
+  gap: 20px;
+  margin-top: 22px;
+  align-items: stretch;
+}
+.calibration-panel,
+.breathing-panel {
+  border: 1px solid var(--line);
+  border-radius: 13px;
+  min-width: 0;
+  min-height: 273px;
+}
+.calibration-panel {
+  padding: 8px 28px 22px;
+  display: flex;
+  flex-direction: column;
+}
+.calibration-panel > h2,
+.breathing-panel > h2 {
+  font-family: var(--serif);
+  font-size: 40px;
+  font-weight: 400;
+  letter-spacing: -0.015em;
+  line-height: 1.2;
+}
+.panel-subtitle {
+  font-size: 20px;
+  line-height: 1.3;
+}
+.calibration-steps {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  margin: 18px 0 24px;
+  gap: 20px;
+}
+.calibration-step {
+  display: flex;
+  align-items: center;
+  gap: 18px;
+  position: relative;
+  min-width: 0;
+}
+.calibration-step + .calibration-step {
+  padding-left: 20px;
+  border-left: 1px solid var(--line);
+}
+.step-number {
+  width: 63px;
+  height: 63px;
+  border: 1px solid var(--ink);
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  font-family: var(--serif);
+  font-size: 28px;
+  flex: none;
+  transition:
+    background 0.25s,
+    color 0.25s;
+}
+.calibration-step.is-active .step-number {
+  color: var(--paper);
+  background: var(--blue);
+}
+.calibration-step.is-complete .step-number {
+  box-shadow: inset 0 0 0 4px var(--paper);
+  background: #e5d5bb;
+}
+.calibration-step h3 {
+  font-size: 17px;
+  font-weight: 500;
+  line-height: 1.4;
+  white-space: nowrap;
+}
+.calibration-step p {
+  font-size: 14px;
+  line-height: 1.5;
+  margin-top: 2px;
+}
+.calibration-actions {
+  display: grid;
+  grid-template-columns: 1.1fr 1fr;
+  gap: 24px;
+  align-items: center;
+  margin-top: auto;
+}
+.button {
+  min-height: 62px;
+  border: 1px solid transparent;
+  border-radius: 10px;
+  padding: 13px 18px;
+  font-size: 20px;
+  font-weight: 500;
+  line-height: 1.3;
+  cursor: pointer;
+  transition:
+    background 0.2s,
+    box-shadow 0.2s,
+    transform 0.2s;
+  white-space: nowrap;
+}
+.button:not(:disabled):hover {
+  transform: translateY(-2px);
+  box-shadow: 0 5px 14px #0b438619;
+}
+.button:not(:disabled):active {
+  transform: translateY(0);
+}
+.button-blue {
+  background: var(--blue);
+  color: var(--white);
+}
+.button-blue:not(:disabled):hover {
+  background: #073771;
+}
+.button-white {
+  background: var(--paper);
+  color: var(--ink);
+}
+.button-white:not(:disabled):hover {
+  background: #fff;
+}
+.download {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 18px;
+  font-size: 17px;
+  white-space: nowrap;
+  text-underline-offset: 3px;
+  min-height: 44px;
+}
+.download:hover {
+  text-decoration-thickness: 2px;
+}
+.calibration-feedback {
+  margin: -10px 0 16px;
+}
+.calibration-status {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+  font-size: 13px;
+  line-height: 1.4;
+  margin-bottom: 6px;
+}
+.progress-track {
+  height: 4px;
+  background: #e6d8c7;
+  border-radius: 4px;
+  overflow: hidden;
+}
+.progress-track span {
+  display: block;
+  height: 100%;
+  width: 0;
+  background: var(--blue);
+  transition: width 0.18s linear;
+}
+.breathing-panel {
+  color: var(--paper);
+  background: linear-gradient(110deg, #124986, #0c407f);
+  border-color: #47709c;
+  padding: 14px 30px 16px;
+  position: relative;
+}
+.breathing-panel > h2 {
+  font-size: 36px;
+  position: relative;
+  z-index: 1;
+}
+.breathing-content {
+  display: grid;
+  grid-template-columns: 1fr 220px 1.2fr;
+  align-items: center;
+  gap: 24px;
+  margin-top: 8px;
+}
+.breathing-phases {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  font-size: 20px;
+  white-space: nowrap;
+}
+.breathing-phases li {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  transition: opacity 0.3s;
+}
+.phase-icon {
+  border: 1px solid #ffffff65;
+  width: 45px;
+  height: 45px;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  flex: none;
+}
+.phase-icon .icon {
+  width: 34px;
+  height: 34px;
+  stroke-width: 1.7;
+}
+.breathing-panel.is-running .breathing-phases li:not(.is-active) {
+  opacity: 0.5;
+}
+.breathing-panel.is-running .breathing-phases li.is-active .phase-icon {
+  background: #ffffff15;
+  border-color: var(--paper);
+}
+.breathing-orbit {
+  width: 220px;
+  height: 220px;
+  border: 1px solid #ffffff70;
+  border-radius: 50%;
+  position: relative;
+  margin-top: -31px;
+  display: grid;
+  place-items: center;
+  isolation: isolate;
+}
+.orbit-inner,
+.orbit-dotted {
+  position: absolute;
+  border-radius: 50%;
+  pointer-events: none;
+}
+.orbit-inner {
+  inset: 17px;
+  border: 2px dotted var(--paper);
+}
+.orbit-dotted {
+  inset: 35px;
+  border: 1px solid #ffffffa0;
+  transition: transform 0.1s linear;
+}
+.orbit-hand {
+  position: absolute;
+  inset: 17px;
+  transform: rotate(0deg);
+}
+.orbit-hand > span {
+  position: absolute;
+  width: 18px;
+  height: 18px;
+  top: -9px;
+  left: calc(50% - 9px);
+  border-radius: 50%;
+  background: var(--paper);
+}
+.breathing-clock {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  position: relative;
+  z-index: 1;
+  line-height: 1.1;
+}
+.breathing-clock > span:first-child {
+  font-size: 70px;
+  line-height: 1.1;
+  font-variant-numeric: tabular-nums;
+}
+.breathing-clock > span:last-child {
+  font-size: 20px;
+}
+.breathing-content > .button {
+  padding-inline: 15px;
+  margin-bottom: 20px;
+  width: 216px;
+  max-width: 100%;
+  justify-self: end;
+  font-size: 19px;
+}
+.action-message {
+  margin: 12px 0 0;
+  font-size: 16px;
+}
+footer {
+  text-align: center;
+  font-size: 18px;
+  line-height: 1.4;
+  margin-top: 24px;
+}
+footer > span {
+  margin: 0 5px;
+}
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+[hidden] {
+  display: none !important;
+}
+@media (min-width: 1450px) {
+  .breathing-content {
+    gap: 24px;
+    grid-template-columns: 1fr 220px 1.2fr;
+  }
+}
+@media (max-width: 1300px) {
+  .app-shell {
+    padding-inline: 28px;
+  }
+  .metric {
+    padding-left: 38px;
+  }
+  .metric-finger {
+    padding-left: 28px;
+    gap: 16px;
+    font-size: 19px;
+  }
+  .controls-grid {
+    grid-template-columns: 1fr 1.08fr;
+    gap: 18px;
+  }
+  .calibration-panel {
+    padding-inline: 20px;
+  }
+  .calibration-steps {
+    gap: 12px;
+  }
+  .calibration-step {
+    gap: 12px;
+  }
+  .calibration-step + .calibration-step {
+    padding-left: 12px;
+  }
+  .step-number {
+    width: 50px;
+    height: 50px;
+    font-size: 24px;
+  }
+  .calibration-step p {
+    font-size: 13px;
+  }
+  .calibration-actions {
+    gap: 12px;
+    grid-template-columns: 1.1fr 1fr;
+  }
+  .button {
+    font-size: 17px;
+    padding-inline: 14px;
+    min-height: 56px;
+  }
+  .download {
+    font-size: 15px;
+    gap: 9px;
+  }
+  .download .icon {
+    width: 26px;
+  }
+  .breathing-panel {
+    padding-inline: 22px;
+  }
+  .breathing-panel > h2 {
+    font-size: 32px;
+  }
+  .breathing-content {
+    gap: 16px;
+    grid-template-columns: 1fr 176px;
+  }
+  .breathing-orbit {
+    width: 176px;
+    height: 176px;
+    grid-column: 2;
+    grid-row: 1 / 3;
+    margin-top: -15px;
+  }
+  .breathing-content > .button {
+    grid-column: 1;
+    grid-row: 2;
+    margin: 0;
+  }
+  .breathing-phases {
+    font-size: 17px;
+    gap: 7px;
+  }
+  .phase-icon {
+    width: 34px;
+    height: 34px;
+  }
+  .phase-icon .icon {
+    width: 26px;
+    height: 26px;
+  }
+  .breathing-clock > span:first-child {
+    font-size: 58px;
+  }
+  .breathing-clock > span:last-child {
+    font-size: 17px;
+  }
+  .orbit-inner,
+  .orbit-hand {
+    inset: 14px;
+  }
+  .orbit-dotted {
+    inset: 28px;
+  }
+  .breathing-content {
+    margin-top: 18px;
+  }
+  .calibration-steps {
+    margin-block: 24px;
+  }
+  .calibration-panel,
+  .breathing-panel {
+    min-height: 280px;
+  }
+}
+@media (max-width: 1000px) {
+  h1 {
+    font-size: 64px;
+  }
+  .wordmark {
+    font-size: 29px;
+  }
+  .metrics {
+    grid-template-columns: 26% 26% 23% 25%;
+    height: 132px;
+  }
+  .metric {
+    padding-left: 24px;
+  }
+  .metric h2 {
+    font-size: 16px;
+  }
+  .metric-current .number {
+    font-size: 100px;
+  }
+  .number {
+    font-size: 56px;
+  }
+  .percent {
+    font-size: 46px;
+  }
+  .metric-detail {
+    font-size: 10px;
+  }
+  .unit,
+  .metric-current .unit {
+    font-size: 18px;
+  }
+  .metric-current .unit {
+    margin-left: 0;
+  }
+  .metric-finger {
+    gap: 10px;
+    padding-left: 20px;
+    font-size: 16px;
+  }
+  .finger-icon {
+    width: 40px;
+    height: 80px;
+  }
+  .controls-grid {
+    grid-template-columns: 1fr;
+  }
+  .calibration-panel {
+    min-height: 252px;
+    padding: 15px 26px 22px;
+  }
+  .calibration-steps {
+    margin-block: 18px 22px;
+    gap: 24px;
+  }
+  .calibration-step + .calibration-step {
+    padding-left: 24px;
+  }
+  .calibration-step {
+    gap: 18px;
+  }
+  .calibration-step p {
+    font-size: 15px;
+  }
+  .calibration-step h3 {
+    font-size: 18px;
+  }
+  .step-number {
+    width: 58px;
+    height: 58px;
+    font-size: 26px;
+  }
+  .calibration-actions {
+    grid-template-columns: 1fr 1fr;
+  }
+  .button {
+    font-size: 18px;
+  }
+  .download {
+    font-size: 17px;
+  }
+  .breathing-panel {
+    padding: 18px 26px;
+    min-height: 267px;
+  }
+  .breathing-content {
+    grid-template-columns: 1fr 210px 1fr;
+    gap: 24px;
+    margin-top: 12px;
+  }
+  .breathing-orbit {
+    width: 210px;
+    height: 210px;
+    grid-row: auto;
+    grid-column: auto;
+    margin-top: -26px;
+  }
+  .breathing-content > .button {
+    grid-column: auto;
+    grid-row: auto;
+    margin-bottom: 12px;
+  }
+  .breathing-phases {
+    font-size: 18px;
+    gap: 12px;
+  }
+  .phase-icon {
+    width: 40px;
+    height: 40px;
+  }
+  .breathing-panel > h2 {
+    font-size: 36px;
+  }
+}
+@media (max-width: 640px) {
+  .app-shell {
+    padding: 17px 20px 22px;
+  }
+  .masthead {
+    height: auto;
+    min-height: 65px;
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 8px;
+    padding-bottom: 12px;
+  }
+  .wordmark {
+    font-size: 27px;
+  }
+  .masthead-status {
+    width: 100%;
+    justify-content: space-between;
+    gap: 12px;
+  }
+  .session-summary {
+    gap: 13px;
+  }
+  .session-summary > div {
+    min-width: 58px;
+  }
+  .session-summary dt {
+    font-size: 8px;
+  }
+  .session-summary dd {
+    font-size: 10px;
+  }
+  .session-summary dd span {
+    font-size: 14px;
+  }
+  .connection {
+    border-left: 0;
+    padding-left: 0;
+    gap: 8px;
+    font-size: 13px;
+  }
+  .connection-dot {
+    width: 8px;
+    height: 8px;
+  }
+  h1 {
+    font-size: clamp(42px, 10vw, 60px);
+    line-height: 1.06;
+    letter-spacing: -0.025em;
+    max-width: 500px;
+    margin: 25px 0 28px;
+  }
+  .metrics {
+    height: auto;
+    grid-template-columns: 1fr 1fr;
+    row-gap: 24px;
+    margin-bottom: 26px;
+  }
+  .metric {
+    min-height: 105px;
+    padding: 0 12px 0 20px;
+  }
+  .metric:first-child {
+    padding-left: 0;
+  }
+  .metric h2 {
+    font-size: 15px;
+  }
+  .metric::before {
+    top: 0;
+    bottom: 0;
+  }
+  .metric-current .number {
+    font-size: 94px;
+    line-height: 1;
+  }
+  .metric-current .unit,
+  .unit {
+    font-size: 17px;
+    margin-left: 0;
+  }
+  .reading {
+    gap: 7px;
+  }
+  .metric-respiration .reading {
+    padding-bottom: 2px;
+  }
+  .number {
+    font-size: 54px;
+  }
+  .percent {
+    font-size: 45px;
+  }
+  .metric-stress {
+    padding-left: 0;
+    min-height: 87px;
+  }
+  .metric-stress::before {
+    display: none;
+  }
+  .metric-stress .reading {
+    padding-bottom: 0;
+  }
+  .metric-detail {
+    font-size: 10px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .metric-finger {
+    padding-left: 20px;
+    gap: 12px;
+    justify-content: flex-start;
+    align-items: center;
+    font-size: 16px;
+    min-height: 87px;
+  }
+  .finger-icon {
+    width: 36px;
+    height: 69px;
+  }
+  .signal-panel {
+    padding: 14px 14px 12px;
+    height: 278px;
+    border-radius: 11px;
+  }
+  .signal-header {
+    min-height: 58px;
+    gap: 8px;
+  }
+  .signal-header h2 {
+    font-size: 23px;
+  }
+  .signal-header p {
+    font-size: 13px;
+  }
+  .legend {
+    font-size: 12px;
+    padding: 5px 7px;
+    gap: 6px;
+    margin-top: 2px;
+  }
+  .legend i {
+    width: 18px;
+    height: 2px;
+  }
+  .time-axis {
+    font-size: 12px;
+    margin-top: 9px;
+  }
+  .controls-grid {
+    gap: 18px;
+    margin-top: 18px;
+  }
+  .calibration-panel {
+    padding: 14px 18px 19px;
+    min-height: 0;
+  }
+  .calibration-panel > h2 {
+    font-size: 34px;
+  }
+  .panel-subtitle {
+    font-size: 16px;
+  }
+  .calibration-steps {
+    grid-template-columns: 1fr;
+    gap: 18px;
+    margin: 22px 0;
+  }
+  .calibration-step + .calibration-step {
+    border-left: 0;
+    padding-left: 0;
+  }
+  .step-number {
+    width: 50px;
+    height: 50px;
+    font-size: 25px;
+  }
+  .calibration-step {
+    gap: 17px;
+  }
+  .calibration-step h3 {
+    font-size: 16px;
+  }
+  .calibration-step p {
+    font-size: 14px;
+  }
+  .desktop-break {
+    display: none;
+  }
+  .calibration-actions {
+    grid-template-columns: 1fr;
+    gap: 12px;
+  }
+  .button {
+    min-height: 54px;
+    font-size: 17px;
+    border-radius: 9px;
+  }
+  .download {
+    font-size: 15px;
+    min-height: 38px;
+    gap: 12px;
+  }
+  .download .icon {
+    width: 25px;
+    height: 25px;
+  }
+  .calibration-feedback {
+    margin: 0 0 18px;
+  }
+  .calibration-status {
+    font-size: 12px;
+  }
+  .breathing-panel {
+    padding: 18px;
+    min-height: 0;
+  }
+  .breathing-panel > h2 {
+    font-size: 30px;
+  }
+  .breathing-content {
+    grid-template-columns: 1fr 145px;
+    gap: 22px 10px;
+    margin-top: 23px;
+  }
+  .breathing-phases {
+    font-size: 15px;
+    gap: 13px;
+  }
+  .breathing-phases li {
+    gap: 9px;
+  }
+  .phase-icon {
+    width: 31px;
+    height: 31px;
+  }
+  .phase-icon .icon {
+    width: 25px;
+    height: 25px;
+  }
+  .breathing-orbit {
+    width: 145px;
+    height: 145px;
+    margin-top: 0;
+  }
+  .orbit-inner,
+  .orbit-hand {
+    inset: 11px;
+  }
+  .orbit-dotted {
+    inset: 23px;
+  }
+  .orbit-hand > span {
+    width: 13px;
+    height: 13px;
+    top: -6.5px;
+    left: calc(50% - 6.5px);
+  }
+  .breathing-clock > span:first-child {
+    font-size: 49px;
+  }
+  .breathing-clock > span:last-child {
+    font-size: 15px;
+  }
+  .breathing-content > .button {
+    grid-column: 1/-1;
+    grid-row: auto;
+    margin: 0;
+    width: 100%;
+  }
+  footer {
+    font-size: 12px;
+    line-height: 1.65;
+    margin: 24px auto 0;
+    max-width: 310px;
+  }
+  footer > span {
+    margin: 0 2px;
+  }
+}
+@media (max-width: 365px) {
+  .app-shell {
+    padding-inline: 15px;
+  }
+  .wordmark {
+    font-size: 25px;
+  }
+  .metric-current .number {
+    font-size: 82px;
+  }
+  .breathing-content {
+    grid-template-columns: 1fr 125px;
+  }
+  .breathing-orbit {
+    width: 125px;
+    height: 125px;
+  }
+  .breathing-panel > h2 {
+    font-size: 28px;
+  }
+  .breathing-phases {
+    font-size: 14px;
+  }
+  .phase-icon {
+    width: 28px;
+    height: 28px;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    transition: none !important;
+    animation: none !important;
+  }
+  .button:not(:disabled):hover {
+    transform: none;
+  }
+}
+@media (min-width: 1301px) and (max-width: 1450px) {
+  .breathing-content {
+    grid-template-columns: minmax(0, 1fr) 190px minmax(0, 1.15fr);
+    gap: 16px;
+  }
+  .breathing-orbit {
+    width: 190px;
+    height: 190px;
+    margin-top: -12px;
+  }
+  .breathing-content > .button {
+    font-size: 17px;
+    width: 100%;
+  }
+  .breathing-clock > span:first-child {
+    font-size: 62px;
+  }
+}
+</style>
+</head>
+<body>
+  <svg class="icon-library" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+    <symbol id="icon-download" viewBox="0 0 32 32"><path d="M16 3v18m-6-6 6 6 6-6M5 22v6h22v-6"/></symbol>
+    <symbol id="icon-inhale" viewBox="0 0 40 40"><path d="M5 15c5 0 5-6 10-6s5 6 10 6 5-6 10-6M5 27c5 0 5-6 10-6s5 6 10 6 5-6 10-6"/></symbol>
+    <symbol id="icon-hold" viewBox="0 0 40 40"><path d="M15 11v18m10-18v18"/></symbol>
+    <symbol id="icon-exhale" viewBox="0 0 40 40"><path d="M5 16h22c8 0 8-11 1-11-3 0-4 2-4 4M5 22h28M5 28h17c9 0 9 10 2 10-3 0-4-2-4-4"/></symbol>
+    <symbol id="icon-finger" viewBox="0 0 64 110"><circle cx="25" cy="11" r="8"/><path d="M20 65V30a5 5 0 0 1 10 0v32-9a5 5 0 0 1 10 0v10-6a5 5 0 0 1 10 0v9-4a5 5 0 0 1 10 0v18c0 12-9 16-9 20v5H28v-7C14 90 13 82 13 71v-8a4 4 0 0 1 7 2Z"/></symbol>
+  </svg>
+  <div class="app-shell">
+    <header class="masthead">
+      <div class="wordmark">Fotopletismografia</div>
+      <div class="masthead-status">
+        <dl class="session-summary" aria-label="Resum de la sessió">
+          <div><dt>Mitjana</dt><dd><span id="average">—</span> BPM</dd></div>
+          <div><dt>Senyal</dt><dd><span id="quality">—</span>%</dd></div>
+        </dl>
+        <div class="connection" id="connection" role="status"><span class="connection-dot" aria-hidden="true"></span><span id="connection-text">Connectant…</span></div>
+      </div>
+    </header>
+    <main>
+      <h1>El teu pols, en temps real.</h1>
+      <section class="metrics" aria-label="Lectures del sensor">
+        <div class="metric metric-current"><h2>BPM actuals</h2><div class="reading"><span class="number" id="bpm">—</span><span class="unit">BPM</span></div></div>
+        <div class="metric metric-respiration"><h2>Respiracions</h2><div class="reading"><span class="number" id="respiration">—</span><span class="unit">RPM</span></div><p class="metric-detail" id="respiration-detail">Esperant un senyal estable</p></div>
+        <div class="metric metric-stress"><h2>Estrès estimat</h2><div class="reading"><span class="number" id="stress">—</span><span class="percent">%</span></div><p class="metric-detail" id="stress-detail">Índex fisiològic</p></div>
+        <div class="metric metric-finger"><svg class="finger-icon" aria-hidden="true"><use href="#icon-finger"/></svg><span id="finger">Connectant…</span></div>
+      </section>
+      <section class="signal-panel" aria-labelledby="signal-heading">
+        <div class="signal-header"><div><h2 id="signal-heading">Senyal de pols</h2><p>Últims 6 segons</p></div><span class="legend"><i aria-hidden="true"></i>PPG (senyal)</span></div>
+        <div class="plot-area"><canvas id="plot" role="img" aria-label="Gràfic del senyal de fotopletismografia durant els últims sis segons"></canvas></div>
+        <div class="time-axis" aria-hidden="true"><span>−6 s</span><span>−5 s</span><span>−4 s</span><span>−3 s</span><span>−2 s</span><span>−1 s</span><span>0 s</span></div>
+      </section>
+      <div class="controls-grid">
+        <section class="calibration-panel" aria-labelledby="calibration-heading">
+          <h2 id="calibration-heading">Calibratge</h2>
+          <p class="panel-subtitle">10 s amb dit · 10 s sense dit</p>
+          <div class="calibration-steps">
+            <div class="calibration-step" id="step-finger"><span class="step-number">01</span><div><h3>10 s amb dit</h3><p>Col·loca el dit suaument<br class="desktop-break"> sobre el sensor.</p></div></div>
+            <div class="calibration-step" id="step-no-finger"><span class="step-number">02</span><div><h3>10 s sense dit</h3><p>Retira el dit del sensor<br class="desktop-break"> i mantén la mà quieta.</p></div></div>
+          </div>
+          <div class="calibration-feedback" id="calibration-feedback" hidden><div class="calibration-status"><span id="calibration-message" role="status"></span><span id="progress-text">0%</span></div><div id="calibration-progress" class="progress-track" role="progressbar" aria-label="Progrés del calibratge" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><span id="progress-fill"></span></div></div>
+          <div class="calibration-actions"><button class="button button-blue" id="calibrate" type="button" disabled>Iniciar el calibratge</button><a class="download" id="download" href="/logs/calibration.log" download="calibration.log"><svg class="icon" aria-hidden="true"><use href="#icon-download"/></svg><span>Descarregar el registre</span></a></div>
+        </section>
+        <section class="breathing-panel" aria-labelledby="breathing-heading">
+          <h2 id="breathing-heading">Respiració 4–7–8</h2>
+          <div class="breathing-content">
+            <ol class="breathing-phases"><li data-phase="1"><span class="phase-icon"><svg class="icon" aria-hidden="true"><use href="#icon-inhale"/></svg></span><span>Inspira 4 s</span></li><li data-phase="2"><span class="phase-icon"><svg class="icon" aria-hidden="true"><use href="#icon-hold"/></svg></span><span>Mantén 7 s</span></li><li data-phase="3"><span class="phase-icon"><svg class="icon" aria-hidden="true"><use href="#icon-exhale"/></svg></span><span>Expira 8 s</span></li></ol>
+            <div class="breathing-orbit" id="breathing-orbit"><div class="orbit-inner"></div><div class="orbit-dotted"></div><div class="orbit-hand" id="orbit-hand"><span></span></div><div class="breathing-clock" role="timer" aria-label="Temporitzador de respiració"><span id="breathing-seconds">4</span><span id="breathing-phase">Inspira</span></div></div>
+            <button class="button button-white" id="breathing" type="button" disabled>Iniciar la respiració</button>
+          </div>
+          <span class="sr-only" id="breathing-announcement" role="status"></span>
+        </section>
+      </div>
+      <p class="action-message" id="action-message" role="status" hidden></p>
+    </main>
+    <footer>Prototip experimental <span aria-hidden="true">·</span> No és un dispositiu mèdic</footer>
+  </div>
+  <script>(() => {
+  'use strict';
+  const $ = (id) => document.getElementById(id);
+  const ui = Object.fromEntries(
+    [
+      'bpm',
+      'average',
+      'quality',
+      'respiration',
+      'respiration-detail',
+      'stress',
+      'stress-detail',
+      'finger',
+      'connection',
+      'connection-text',
+      'calibrate',
+      'breathing',
+      'calibration-feedback',
+      'calibration-message',
+      'calibration-progress',
+      'progress-fill',
+      'progress-text',
+      'step-finger',
+      'step-no-finger',
+      'breathing-seconds',
+      'breathing-phase',
+      'breathing-orbit',
+      'orbit-hand',
+      'breathing-announcement',
+      'action-message',
+    ].map((id) => [id, $(id)]),
+  );
+  const phases = [
+    { name: 'Inspira', duration: 4, start: 0 },
+    { name: 'Mantén', duration: 7, start: 4 },
+    { name: 'Expira', duration: 8, start: 11 },
+  ];
+  const reducedMotion = matchMedia('(prefers-reduced-motion: reduce)');
+  const canvas = $('plot');
+  const context = canvas.getContext('2d');
+  const samples = [];
+  let sequence = 0;
+  let lastPacketAt = 0;
+  let scale = 1;
+  let connected = false;
+  let currentState = null;
+  let calibratePending = false;
+  let breathingPending = false;
+  let calibrationSeen = false;
+  let calibrationCompleteAt = 0;
+  let breathingStartedAt = 0;
+  let announcedPhase = -1;
+  let width = 0;
+  let height = 0;
+  let lastFrameAt = 0;
+
+  // Only a locally accepted breathing command is remembered; no readings are synthesized here.
+  try {
+    const saved = Number(sessionStorage.getItem('ppg-breathing-start'));
+    if (saved > Date.now() - 19000 && saved <= Date.now())
+      breathingStartedAt = saved;
+  } catch (_) {
+    /* Storage may be disabled in an embedded browser. */
+  }
+
+  function rememberBreathing() {
+    try {
+      if (breathingStartedAt)
+        sessionStorage.setItem(
+          'ppg-breathing-start',
+          String(breathingStartedAt),
+        );
+      else sessionStorage.removeItem('ppg-breathing-start');
+    } catch (_) {
+      /* The timer also works without persistence. */
+    }
+  }
+
+  function resize() {
+    const bounds = canvas.getBoundingClientRect();
+    width = bounds.width;
+    height = bounds.height;
+    const ratio = Math.min(devicePixelRatio || 1, 2);
+    canvas.width = Math.round(width * ratio);
+    canvas.height = Math.round(height * ratio);
+    context.setTransform(ratio, 0, 0, ratio, 0, 0);
+  }
+  new ResizeObserver(resize).observe(canvas.parentElement);
+
+  function showMessage(message = '') {
+    ui['action-message'].textContent = message;
+    ui['action-message'].hidden = !message;
+  }
+
+  async function request(path, options = {}) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 3500);
+    try {
+      const response = await fetch(path, {
+        cache: 'no-store',
+        ...options,
+        signal: controller.signal,
+      });
+      if (!response.ok) {
+        const error = new Error(`HTTP ${response.status}`);
+        error.status = response.status;
+        throw error;
+      }
+      // Keep the timeout active until the body has arrived, including slow responses.
+      return options.download ? await response.blob() : await response.json();
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  function refreshButtons() {
+    ui.calibrate.disabled =
+      !connected || calibratePending || Boolean(currentState?.calibrating);
+    ui.breathing.disabled =
+      !connected || breathingPending || Boolean(breathingStartedAt);
+    ui.calibrate.textContent = calibratePending
+      ? 'Iniciant…'
+      : currentState?.calibrating
+        ? 'Calibrant…'
+        : 'Iniciar el calibratge';
+    ui.breathing.textContent = breathingPending
+      ? 'Iniciant…'
+      : breathingStartedAt
+        ? 'Respiració en curs'
+        : 'Iniciar la respiració';
+  }
+
+  function renderCalibration(state) {
+    if (state.calibrating) {
+      calibrationSeen = true;
+      calibrationCompleteAt = 0;
+    } else if (calibrationSeen && !calibrationCompleteAt) {
+      calibrationCompleteAt = Date.now();
+    }
+    const show =
+      state.calibrating ||
+      (calibrationSeen && Date.now() - calibrationCompleteAt < 6500) ||
+      state.phase === 'failed';
+    ui['calibration-feedback'].hidden = !show;
+    const progress = Math.max(0, Math.min(100, Number(state.progress) || 0));
+    ui['calibration-message'].textContent =
+      state.phase === 'complete' ? 'Calibratge completat' : state.cal_message;
+    ui['progress-text'].textContent = `${progress}%`;
+    ui['progress-fill'].style.width = `${progress}%`;
+    ui['calibration-progress'].setAttribute('aria-valuenow', String(progress));
+    ui['step-finger'].classList.toggle(
+      'is-active',
+      ['prepare_finger', 'sample_finger'].includes(state.phase),
+    );
+    ui['step-no-finger'].classList.toggle(
+      'is-active',
+      ['prepare_no_finger', 'sample_no_finger'].includes(state.phase),
+    );
+    ui['step-finger'].classList.toggle(
+      'is-complete',
+      show &&
+        ['prepare_no_finger', 'sample_no_finger', 'complete'].includes(
+          state.phase,
+        ),
+    );
+    ui['step-no-finger'].classList.toggle(
+      'is-complete',
+      show && state.phase === 'complete',
+    );
+  }
+
+  function acceptState(state) {
+    if (
+      !Number.isFinite(state.seq) ||
+      !Array.isArray(state.signal) ||
+      typeof state.calibrated !== 'boolean'
+    )
+      throw new Error('Resposta d’estat no vàlida');
+    const now = performance.now();
+    const values = state.signal.filter(Number.isFinite);
+    const gap = sequence && state.seq > sequence + values.length;
+    if (state.seq < sequence || gap) samples.length = 0;
+    const firstSeq = state.seq - values.length + 1;
+    values.forEach((value, index) => {
+      const seq = firstSeq + index;
+      if (!samples.length || seq > samples[samples.length - 1].seq)
+        samples.push({ seq, value });
+    });
+    while (samples.length > 340) samples.shift();
+    if (state.seq !== sequence) lastPacketAt = now;
+    sequence = state.seq;
+    currentState = state;
+    connected = true;
+    ui.connection.dataset.state = 'connected';
+    ui['connection-text'].textContent =
+      state.simulated === true ? 'Mode simulat' : 'ESP32 connectat';
+    if (state.bpm_valid && Number.isFinite(state.bpm))
+      ui.bpm.textContent = Math.round(state.bpm);
+    if (state.bpm_average_ready && Number.isFinite(state.bpm_average))
+      ui.average.textContent = Math.round(state.bpm_average);
+    if (state.finger && Number.isFinite(state.quality))
+      ui.quality.textContent = Math.round(state.quality);
+    const respirationValid =
+      state.finger &&
+      !state.calibrating &&
+      !state.breathing_running &&
+      state.respiration_valid === true &&
+      Number.isFinite(state.respiration_rate);
+    const stressValid =
+      state.finger &&
+      !state.calibrating &&
+      !state.breathing_running &&
+      state.stress_valid === true &&
+      Number.isFinite(state.stress_score);
+    if (respirationValid)
+      ui.respiration.textContent = Math.round(state.respiration_rate);
+    if (stressValid) ui.stress.textContent = Math.round(state.stress_score);
+    const respirationWindow = Math.max(
+      0,
+      Math.min(32, Math.floor(Number(state.respiration_window_s) || 0)),
+    );
+    ui['respiration-detail'].textContent = state.breathing_running
+      ? 'En pausa durant la guia'
+      : respirationValid
+        ? `${Math.max(1, Number(state.respiration_sources) || 1)}/3 senyals · Confiança ${Math.round(state.respiration_confidence)}%`
+        : state.finger
+          ? `Analitzant ${respirationWindow}/32 s`
+          : 'Esperant un senyal estable';
+    const stressLabels = {
+      very_low: 'Molt baix',
+      low: 'Baix',
+      moderate: 'Moderado',
+      high: 'Alt',
+      very_high: 'Molt alt',
+    };
+    ui['stress-detail'].textContent = stressValid
+      ? `Fisiològic · ${stressLabels[state.stress_state] || 'Estimat'} · ${state.stress_uses_respiration ? 'Pols + resp.' : 'Pols/PRV'}`
+      : state.breathing_running
+        ? 'En pausa durant la guia'
+        : state.finger
+          ? `Analitzant ${Math.min(30, Math.floor(Number(state.stress_window_s) || 0))}/30 s`
+          : 'Esperant el dit';
+    ui.finger.textContent = state.calibrating
+      ? 'Calibrant el sensor'
+      : !state.calibrated
+        ? 'Sense calibrar'
+        : state.finger
+          ? 'Dit detectat'
+          : 'Sense dit';
+    ui.finger.parentElement.dataset.present = String(
+      state.finger && !state.calibrating,
+    );
+    ui.bpm.parentElement.title = state.bpm_valid
+      ? 'Mediana recent dels intervals de pols'
+      : 'Esperant un senyal vàlid';
+    ui.respiration.parentElement.parentElement.title = respirationValid
+      ? 'Fusió de les variacions d’intensitat, amplitud i freqüència de la PPG'
+      : 'Calen almenys 32 segons amb el dit quiet';
+    ui.stress.parentElement.parentElement.title = stressValid
+      ? 'Índex fisiològic experimental basat en la variabilitat del pols i la respiració; no mesura l’estrès psicològic'
+      : 'Calen almenys 30 segons d’intervals de pols vàlids';
+    ui.quality.parentElement.title =
+      {
+        no_finger: 'Sense dit',
+        weak_signal: 'Senyal insuficient',
+        stabilizing: 'Estabilitzant',
+        valid: 'Senyal vàlid',
+      }[state.quality_state] || '';
+    renderCalibration(state);
+    // El ESP32 y el servidor de demostración publican su reloj de respiración.
+    if (typeof state.breathing_running === 'boolean') {
+      const nextStart = state.breathing_running
+        ? Date.now() - state.breathing_elapsed_ms
+        : 0;
+      if (Boolean(nextStart) !== Boolean(breathingStartedAt))
+        announcedPhase = -1;
+      breathingStartedAt = nextStart;
+      rememberBreathing();
+    }
+    refreshButtons();
+  }
+
+  async function poll() {
+    try {
+      acceptState(await request(`/api/state?since=${sequence}`));
+    } catch (_) {
+      connected = false;
+      ui.connection.dataset.state = 'offline';
+      ui['connection-text'].textContent = 'Sense connexió';
+      ui['respiration-detail'].textContent = 'Esperant un senyal estable';
+      ui['stress-detail'].textContent = 'Esperant la connexió';
+      ui.finger.textContent = 'Sense connexió';
+      ui.finger.parentElement.dataset.present = 'false';
+      refreshButtons();
+    }
+    setTimeout(poll, connected ? 150 : 1000);
+  }
+
+  function drawSignal(now) {
+    context.clearRect(0, 0, width, height);
+    if (samples.length < 2 || !width || !height) return;
+    const extent = samples.reduce(
+      (largest, sample) => Math.max(largest, Math.abs(sample.value)),
+      0,
+    );
+    const target = Math.max(0.5, extent * 1.08);
+    // Fit every peak immediately; ease back only when the signal becomes smaller.
+    scale = target > scale ? target : scale + (target - scale) * 0.008;
+    // One packet of latency lets real 50 Hz samples move continuously between HTTP responses.
+    const drift =
+      connected && !reducedMotion.matches
+        ? Math.min(8, (now - lastPacketAt) / 20)
+        : 0;
+    const rightSeq = sequence - 8 + drift;
+    const leftSeq = rightSeq - 300;
+    const amplitude = Math.max(0, (height - 24) / 2);
+    context.strokeStyle = '#034ab1';
+    context.lineWidth = width < 600 ? 2.4 : 3;
+    context.lineJoin = context.lineCap = 'round';
+    context.beginPath();
+    const points = samples.map((sample) => ({
+      x: ((sample.seq - leftSeq) / 300) * width,
+      y: height / 2 - (sample.value / scale) * amplitude,
+    }));
+    context.moveTo(points[0].x, points[0].y);
+    // Bound the curve controls to each pair of samples to prevent interpolation overshoot.
+    for (let index = 0; index < points.length - 1; index++) {
+      const before = points[Math.max(0, index - 1)];
+      const from = points[index];
+      const to = points[index + 1];
+      const after = points[Math.min(points.length - 1, index + 2)];
+      const lower = Math.min(from.y, to.y);
+      const upper = Math.max(from.y, to.y);
+      const bound = (y) => Math.max(lower, Math.min(upper, y));
+      context.bezierCurveTo(
+        from.x + (to.x - before.x) / 6,
+        bound(from.y + (to.y - before.y) / 6),
+        to.x - (after.x - from.x) / 6,
+        bound(to.y - (after.y - from.y) / 6),
+        to.x,
+        to.y,
+      );
+    }
+    context.stroke();
+  }
+
+  function drawBreathing() {
+    let elapsed = breathingStartedAt
+      ? (Date.now() - breathingStartedAt) / 1000
+      : 0;
+    if (elapsed >= 19) {
+      breathingStartedAt = 0;
+      elapsed = 0;
+      rememberBreathing();
+      ui['breathing-announcement'].textContent = 'Respiració completada.';
+      refreshButtons();
+    }
+    const running = Boolean(breathingStartedAt);
+    const phaseIndex = elapsed < 4 ? 0 : elapsed < 11 ? 1 : 2;
+    const phase = phases[phaseIndex];
+    const seconds = Math.max(
+      1,
+      Math.ceil(phase.duration - (elapsed - phase.start)),
+    );
+    ui['breathing-seconds'].textContent = running ? seconds : '4';
+    ui['breathing-phase'].textContent = running ? phase.name : 'Inspira';
+    ui['breathing-orbit']
+      .closest('section')
+      .classList.toggle('is-running', running);
+    ui['orbit-hand'].style.transform =
+      `rotate(${running && !reducedMotion.matches ? (elapsed / 19) * 360 : 0}deg)`;
+    const expansion =
+      !running || reducedMotion.matches
+        ? 1
+        : phaseIndex === 0
+          ? 0.88 + (elapsed / 4) * 0.2
+          : phaseIndex === 1
+            ? 1.08
+            : 1.08 - ((elapsed - 11) / 8) * 0.2;
+    ui['breathing-orbit'].querySelector('.orbit-dotted').style.transform =
+      `scale(${expansion})`;
+    document
+      .querySelectorAll('[data-phase]')
+      .forEach((row, index) =>
+        row.classList.toggle('is-active', running && index === phaseIndex),
+      );
+    if (running && announcedPhase !== phaseIndex) {
+      announcedPhase = phaseIndex;
+      ui['breathing-announcement'].textContent =
+        `${phase.name}, ${phase.duration} segons.`;
+    }
+  }
+
+  function frame(now) {
+    if (
+      !document.hidden &&
+      now - lastFrameAt >= (reducedMotion.matches ? 150 : 15)
+    ) {
+      drawSignal(now);
+      drawBreathing();
+      lastFrameAt = now;
+    }
+    requestAnimationFrame(frame);
+  }
+
+  ui.calibrate.addEventListener('click', async () => {
+    calibratePending = true;
+    refreshButtons();
+    showMessage();
+    try {
+      await request('/api/calibrate', { method: 'POST' });
+      calibrationSeen = true;
+      calibrationCompleteAt = 0;
+      acceptState(await request(`/api/state?since=${sequence}`));
+    } catch (error) {
+      showMessage(
+        error.status === 409
+          ? 'Ja hi ha un calibratge en curs.'
+          : 'No s’ha pogut iniciar el calibratge. Comprova la connexió i torna-ho a provar.',
+      );
+    } finally {
+      calibratePending = false;
+      refreshButtons();
+    }
+  });
+
+  ui.breathing.addEventListener('click', async () => {
+    breathingPending = true;
+    refreshButtons();
+    showMessage();
+    try {
+      await request('/api/breathing', { method: 'POST' });
+      breathingStartedAt = Date.now();
+      announcedPhase = -1;
+      rememberBreathing();
+    } catch (error) {
+      showMessage(
+        error.status === 409
+          ? 'Ja hi ha una respiració en curs.'
+          : 'No s’ha pogut iniciar la respiració. Comprova la connexió i torna-ho a provar.',
+      );
+    } finally {
+      breathingPending = false;
+      refreshButtons();
+    }
+  });
+
+  $('download').addEventListener('click', async (event) => {
+    event.preventDefault();
+    showMessage();
+    try {
+      const blob = await request('/logs/calibration.log', { download: true });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = currentState?.simulated
+        ? 'calibration.simulated.log'
+        : 'calibration.log';
+      document.body.append(link);
+      link.click();
+      link.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 10000);
+    } catch (error) {
+      showMessage(
+        error.status === 404
+          ? 'Encara no hi ha cap registre. Completa primer un calibratge.'
+          : 'No s’ha pogut descarregar el registre. Comprova la connexió.',
+      );
+    }
+  });
+
+  resize();
+  poll();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
+)HTML";
+
+bool calibrationRunning(CalibrationPhase value) {
+  return value == CalibrationPhase::PREPARE_FINGER ||
+         value == CalibrationPhase::SAMPLE_FINGER ||
+         value == CalibrationPhase::PREPARE_NO_FINGER ||
+         value == CalibrationPhase::SAMPLE_NO_FINGER;
+}
+
+const char *phaseName(CalibrationPhase value) {
+  switch (value) {
+    case CalibrationPhase::PREPARE_FINGER: return "prepare_finger";
+    case CalibrationPhase::SAMPLE_FINGER: return "sample_finger";
+    case CalibrationPhase::PREPARE_NO_FINGER: return "prepare_no_finger";
+    case CalibrationPhase::SAMPLE_NO_FINGER: return "sample_no_finger";
+    case CalibrationPhase::COMPLETE: return "complete";
+    case CalibrationPhase::FAILED: return "failed";
+    default: return "idle";
+  }
+}
+
+uint8_t phaseProgress(CalibrationPhase value, uint32_t started, uint32_t now) {
+  if (value == CalibrationPhase::COMPLETE) return 100;
+  if (!calibrationRunning(value)) return 0;
+  constexpr uint32_t total = 2 * PREPARE_MS + 2 * CALIBRATION_SAMPLE_MS;
+  uint32_t base = 0;
+  if (value == CalibrationPhase::SAMPLE_FINGER) base = PREPARE_MS;
+  else if (value == CalibrationPhase::PREPARE_NO_FINGER) base = PREPARE_MS + CALIBRATION_SAMPLE_MS;
+  else if (value == CalibrationPhase::SAMPLE_NO_FINGER) base = 2 * PREPARE_MS + CALIBRATION_SAMPLE_MS;
+  return min<uint32_t>(99, ((base + now - started) * 100UL) / total);
+}
+
+int compareUint16(const void *a, const void *b) {
+  const uint16_t left = *static_cast<const uint16_t *>(a);
+  const uint16_t right = *static_cast<const uint16_t *>(b);
+  return left < right ? -1 : left > right ? 1 : 0;
+}
+
+uint16_t medianCopy(const uint16_t *values, size_t count) {
+  if (!count) return 0;
+  memcpy(scratch, values, count * sizeof(uint16_t));
+  qsort(scratch, count, sizeof(uint16_t), compareUint16);
+  return count & 1 ? scratch[count / 2]
+                   : static_cast<uint16_t>((static_cast<uint32_t>(scratch[count / 2 - 1]) + scratch[count / 2]) / 2);
+}
+
+uint16_t madOf(const uint16_t *values, size_t count, uint16_t median) {
+  for (size_t i = 0; i < count; ++i) scratch[i] = values[i] > median ? values[i] - median : median - values[i];
+  qsort(scratch, count, sizeof(uint16_t), compareUint16);
+  return count & 1 ? scratch[count / 2]
+                   : static_cast<uint16_t>((static_cast<uint32_t>(scratch[count / 2 - 1]) + scratch[count / 2]) / 2);
+}
+
+float medianIbi() {
+  if (!ibiCount) return 0;
+  uint16_t ordered[IBI_HISTORY];
+  memcpy(ordered, ibis, ibiCount * sizeof(uint16_t));
+  qsort(ordered, ibiCount, sizeof(uint16_t), compareUint16);
+  return ordered[ibiCount / 2];
+}
+
+float robustMeanIbi() {
+  if (!ibiCount) return 0;
+  uint16_t ordered[IBI_HISTORY];
+  memcpy(ordered, ibis, ibiCount * sizeof(uint16_t));
+  qsort(ordered, ibiCount, sizeof(uint16_t), compareUint16);
+  const size_t first = ibiCount >= 5 ? 1 : 0;
+  const size_t last = ibiCount >= 5 ? ibiCount - 1 : ibiCount;
+  uint32_t sum = 0;
+  for (size_t i = first; i < last; ++i) sum += ordered[i];
+  return static_cast<float>(sum) / (last - first);
+}
+
+float ibiVariation(float median) {
+  if (!ibiCount || median <= 0) return 1;
+  uint16_t deviation[IBI_HISTORY];
+  for (size_t i = 0; i < ibiCount; ++i) deviation[i] = abs(static_cast<int>(ibis[i]) - static_cast<int>(median));
+  qsort(deviation, ibiCount, sizeof(uint16_t), compareUint16);
+  return deviation[ibiCount / 2] / median;
+}
+
+void resetDerivedAnalysis() {
+  if (derivedCollecting || respirationCount || prvCount || respirationValid || stressValid) {
+    memset(respirationFeatures, 0, sizeof(respirationFeatures));
+    memset(respirationSignalQuality, 0, sizeof(respirationSignalQuality));
+    memset(prvIntervals, 0, sizeof(prvIntervals));
+    memset(prvTimes, 0, sizeof(prvTimes));
+  }
+  respirationIndex = respirationCount = 0;
+  respirationDecimator = 0;
+  latestPulseAmplitude = 0;
+  latestAcceptedIbi = 0;
+  respirationRate = respirationConfidence = 0;
+  respirationValid = false;
+  respirationSources = 0;
+  respirationCandidate = 0;
+  respirationCandidateStreak = 0;
+  respirationLastSuccessMs = 0;
+  prvIndex = prvCount = 0;
+  stressScore = stressConfidence = 0;
+  rmssdMs = baevskyStressIndex = 0;
+  stressValid = false;
+  stressUsesRespiration = false;
+  stressLastSuccessMs = 0;
+  stressState = "unavailable";
+  lastDerivedUpdateMs = derivedStartedMs = 0;
+  derivedCollecting = false;
+}
+
+void recordPrvInterval(uint16_t interval, uint32_t now) {
+  latestAcceptedIbi = interval;
+  if (!derivedCollecting) return;
+  prvIntervals[prvIndex] = interval;
+  prvTimes[prvIndex] = now;
+  prvIndex = (prvIndex + 1) % PRV_HISTORY;
+  if (prvCount < PRV_HISTORY) ++prvCount;
+}
+
+float derivedSignalEvidence() {
+  if (!respirationCount) return 0;
+  const size_t start =
+      (respirationIndex + RESPIRATION_WINDOW - respirationCount) % RESPIRATION_WINDOW;
+  float sum = 0;
+  for (size_t i = 0; i < respirationCount; ++i) {
+    sum += respirationSignalQuality[(start + i) % RESPIRATION_WINDOW];
+  }
+  return sum / respirationCount;
+}
+
+float medianSmall(float *values, size_t count) {
+  for (size_t i = 1; i < count; ++i) {
+    const float value = values[i];
+    size_t position = i;
+    while (position && values[position - 1] > value) {
+      values[position] = values[position - 1];
+      --position;
+    }
+    values[position] = value;
+  }
+  return values[count / 2];
+}
+
+bool respiratorySpectralPeak(uint8_t feature, float &rate, float &quality) {
+  if (respirationCount < RESPIRATION_MIN_SAMPLES) return false;
+  const size_t start =
+      (respirationIndex + RESPIRATION_WINDOW - respirationCount) % RESPIRATION_WINDOW;
+  float seriesMinimum = respirationFeatures[feature][start];
+  float seriesMaximum = seriesMinimum;
+  for (size_t i = 0; i < respirationCount; ++i) {
+    const float value =
+        respirationFeatures[feature][(start + i) % RESPIRATION_WINDOW];
+    respirationClean[i] = value;
+    seriesMinimum = min(seriesMinimum, value);
+    seriesMaximum = max(seriesMaximum, value);
+  }
+
+  // Un Hampel corto elimina movimientos aislados sin borrar la oscilacion lenta
+  // de la respiracion. La literatura de RR por PPG recomienda tratar estos
+  // saltos antes de buscar la frecuencia dominante.
+  const float outlierFloor = max(1e-4f, 0.015f * (seriesMaximum - seriesMinimum));
+  for (size_t i = 0; i < respirationCount; ++i) {
+    float neighborhood[7];
+    float deviations[7];
+    size_t neighborhoodCount = 0;
+    const size_t first = i > 3 ? i - 3 : 0;
+    const size_t last = min(respirationCount - 1, i + 3);
+    for (size_t j = first; j <= last; ++j) {
+      neighborhood[neighborhoodCount++] = respirationClean[j];
+    }
+    const float median = medianSmall(neighborhood, neighborhoodCount);
+    for (size_t j = first, k = 0; j <= last; ++j, ++k) {
+      deviations[k] = fabsf(respirationClean[j] - median);
+    }
+    const float mad = medianSmall(deviations, neighborhoodCount);
+    const float threshold = max(outlierFloor, 4.4478f * mad);
+    respirationWork[i] = fabsf(respirationClean[i] - median) > threshold
+        ? median : respirationClean[i];
+  }
+
+  const float midpoint = 0.5f * (respirationCount - 1);
+  float mean = 0;
+  for (size_t i = 0; i < respirationCount; ++i) {
+    mean += respirationWork[i];
+  }
+  mean /= respirationCount;
+  float covariance = 0, timeVariance = 0;
+  for (size_t i = 0; i < respirationCount; ++i) {
+    const float centeredTime = i - midpoint;
+    covariance += centeredTime * (respirationWork[i] - mean);
+    timeVariance += centeredTime * centeredTime;
+  }
+  const float slope = timeVariance > 0 ? covariance / timeVariance : 0;
+  float energy = 0;
+  for (size_t i = 0; i < respirationCount; ++i) {
+    const float window = 0.5f - 0.5f * cosf(2.0f * PI * i / (respirationCount - 1));
+    respirationWork[i] =
+        (respirationWork[i] - mean - slope * (i - midpoint)) * window;
+    energy += respirationWork[i] * respirationWork[i];
+  }
+  if (energy < 1e-6f) return false;
+
+  size_t bestIndex = 0;
+  float bestPower = 0;
+  for (size_t frequencyIndex = 0;
+       frequencyIndex < RESPIRATION_FREQUENCIES; ++frequencyIndex) {
+    const float rpm = RESPIRATION_MIN_RPM + frequencyIndex * RESPIRATION_STEP_RPM;
+    const float step = 2.0f * PI * (rpm / 60.0f) / RESPIRATION_SAMPLE_HZ;
+    const float cosineStep = cosf(step);
+    const float sineStep = sinf(step);
+    float cosine = 1.0f;
+    float sine = 0.0f;
+    float real = 0, imaginary = 0;
+    for (size_t i = 0; i < respirationCount; ++i) {
+      real += respirationWork[i] * cosine;
+      imaginary -= respirationWork[i] * sine;
+      const float nextCosine = cosine * cosineStep - sine * sineStep;
+      sine = sine * cosineStep + cosine * sineStep;
+      cosine = nextCosine;
+      if ((i & 63U) == 63U) {
+        const float norm = sqrtf(cosine * cosine + sine * sine);
+        if (norm > 0) { cosine /= norm; sine /= norm; }
+      }
+    }
+    const float power = real * real + imaginary * imaginary;
+    respirationSpectrum[frequencyIndex] = power;
+    if (power > bestPower) {
+      bestPower = power;
+      bestIndex = frequencyIndex;
+    }
+  }
+
+  float secondPower = 0;
+  for (size_t i = 0; i < RESPIRATION_FREQUENCIES; ++i) {
+    if (abs(static_cast<int>(i) - static_cast<int>(bestIndex)) <= 4) continue;
+    secondPower = max(secondPower, respirationSpectrum[i]);
+  }
+  const float prominence = bestPower / max(secondPower, 1e-9f);
+  const float coherence = constrain(
+      2.0f * bestPower / (respirationCount * energy), 0.0f, 1.0f);
+  const float prominenceQuality =
+      constrain((prominence - 1.10f) / 1.90f, 0.0f, 1.0f);
+  const float coherenceQuality = constrain(coherence / 0.18f, 0.0f, 1.0f);
+  const float collectionQuality =
+      constrain(derivedSignalEvidence() / 65.0f, 0.35f, 1.0f);
+  quality = 100.0f * sqrtf(prominenceQuality * coherenceQuality) *
+            collectionQuality;
+  rate = RESPIRATION_MIN_RPM + bestIndex * RESPIRATION_STEP_RPM;
+  return prominence >= 1.12f && coherence >= 0.025f && quality >= 15.0f;
+}
+
+void rejectRespirationEstimate(uint32_t now) {
+  respirationSources = 0;
+  if (respirationLastSuccessMs &&
+      now - respirationLastSuccessMs <= DERIVED_RESULT_GRACE_MS) {
+    respirationConfidence = max(25.0f, respirationConfidence * 0.82f);
+    respirationValid = true;
+  } else {
+    respirationConfidence = 0;
+    respirationValid = false;
+  }
+}
+
+void estimateRespiration(uint32_t now) {
+  float rates[3] = {0}, qualities[3] = {0};
+  bool usable[3] = {false};
+  uint8_t usableCount = 0;
+  for (uint8_t feature = 0; feature < 3; ++feature) {
+    usable[feature] = respiratorySpectralPeak(feature, rates[feature], qualities[feature]);
+    if (usable[feature]) ++usableCount;
+  }
+  if (!usableCount) { rejectRespirationEstimate(now); return; }
+
+  int8_t pairA = -1, pairB = -1;
+  float smallestDifference = 1000;
+  for (uint8_t a = 0; a < 3; ++a) {
+    if (!usable[a]) continue;
+    for (uint8_t b = a + 1; b < 3; ++b) {
+      if (!usable[b]) continue;
+      const float difference = fabsf(rates[a] - rates[b]);
+      if (difference < smallestDifference) {
+        smallestDifference = difference;
+        pairA = a;
+        pairB = b;
+      }
+    }
+  }
+  float estimate = 0;
+  float spectral = 0;
+  float agreement = 0;
+  bool consensus = pairA >= 0 && smallestDifference <= 4.0f;
+  respirationSources = 0;
+  if (consensus) {
+    float weightedRate = rates[pairA] * qualities[pairA] +
+                         rates[pairB] * qualities[pairB];
+    float weight = qualities[pairA] + qualities[pairB];
+    float minimumRate = min(rates[pairA], rates[pairB]);
+    float maximumRate = max(rates[pairA], rates[pairB]);
+    respirationSources = 2;
+    for (uint8_t feature = 0; feature < 3; ++feature) {
+      if (!usable[feature] || feature == pairA || feature == pairB) continue;
+      const float pairMean = 0.5f * (rates[pairA] + rates[pairB]);
+      if (fabsf(rates[feature] - pairMean) <= 4.0f) {
+        weightedRate += rates[feature] * qualities[feature];
+        weight += qualities[feature];
+        minimumRate = min(minimumRate, rates[feature]);
+        maximumRate = max(maximumRate, rates[feature]);
+        ++respirationSources;
+      }
+    }
+    estimate = weightedRate / max(weight, 1.0f);
+    spectral = constrain(weight / respirationSources, 0.0f, 100.0f);
+    agreement = constrain(
+        100.0f * (1.0f - (maximumRate - minimumRate) / 8.0f), 0.0f, 100.0f);
+  } else {
+    uint8_t bestFeature = 0;
+    for (uint8_t feature = 1; feature < 3; ++feature) {
+      if (qualities[feature] > qualities[bestFeature]) bestFeature = feature;
+    }
+    if (!usable[bestFeature] || qualities[bestFeature] < 50.0f) {
+      rejectRespirationEstimate(now);
+      return;
+    }
+    estimate = rates[bestFeature];
+    spectral = qualities[bestFeature];
+    agreement = 55.0f;
+    respirationSources = 1;
+  }
+
+  if (respirationCandidateStreak &&
+      fabsf(estimate - respirationCandidate) <= 3.0f) {
+    respirationCandidate = 0.65f * respirationCandidate + 0.35f * estimate;
+    if (respirationCandidateStreak < 255) ++respirationCandidateStreak;
+  } else {
+    respirationCandidate = estimate;
+    respirationCandidateStreak = 1;
+  }
+  if (!consensus && respirationCandidateStreak < 2) {
+    rejectRespirationEstimate(now);
+    return;
+  }
+
+  const float evidence = constrain(
+      100.0f * (respirationCount - RESPIRATION_MIN_SAMPLES) /
+          (RESPIRATION_WINDOW - RESPIRATION_MIN_SAMPLES),
+      0.0f, 100.0f);
+  const float signalEvidence = derivedSignalEvidence();
+  respirationConfidence = 0.45f * spectral + 0.30f * agreement +
+                          0.15f * evidence + 0.10f * signalEvidence;
+  if (respirationConfidence < 35.0f) {
+    rejectRespirationEstimate(now);
+    return;
+  }
+  respirationRate = respirationValid
+      ? 0.72f * respirationRate + 0.28f * respirationCandidate
+      : respirationCandidate;
+  respirationValid = true;
+  respirationLastSuccessMs = now;
+}
+
+float baevskyScoreToPercent(float index) {
+  if (index <= 50.0f) return constrain(index * 0.40f, 0.0f, 20.0f);
+  if (index <= 150.0f) return 20.0f + (index - 50.0f) * 0.25f;
+  if (index <= 300.0f) return 45.0f + (index - 150.0f) * (20.0f / 150.0f);
+  if (index <= 500.0f) return 65.0f + (index - 300.0f) * 0.085f;
+  if (index <= 900.0f) return 82.0f + (index - 500.0f) * 0.045f;
+  return 100.0f;
+}
+
+float respirationLoadPercent(float rpm) {
+  if (rpm <= 6.0f) return 0;
+  if (rpm <= 12.0f) return (rpm - 6.0f) * (10.0f / 6.0f);
+  if (rpm <= 20.0f) return 10.0f + (rpm - 12.0f) * 5.0f;
+  if (rpm <= 30.0f) return 50.0f + (rpm - 20.0f) * 5.0f;
+  return 100.0f;
+}
+
+float rmssdLoadPercent(float value) {
+  // Menor RMSSD implica menor modulacion parasimpatica. Son zonas orientativas
+  // para reposo y se combinan con Baevsky; no constituyen una escala clinica.
+  if (value <= 12.0f) return 100.0f;
+  if (value <= 25.0f) return 100.0f - (value - 12.0f) * (20.0f / 13.0f);
+  if (value <= 45.0f) return 80.0f - (value - 25.0f) * 2.0f;
+  if (value <= 80.0f) return 40.0f - (value - 45.0f) * (40.0f / 35.0f);
+  return 0.0f;
+}
+
+void rejectStressEstimate(uint32_t now) {
+  if (stressLastSuccessMs &&
+      now - stressLastSuccessMs <= DERIVED_RESULT_GRACE_MS) {
+    stressConfidence = max(25.0f, stressConfidence * 0.85f);
+    stressValid = true;
+  } else {
+    stressConfidence = 0;
+    stressValid = false;
+    stressUsesRespiration = false;
+    stressState = "unavailable";
+  }
+}
+
+void estimateStress(uint32_t now) {
+  if (!derivedStartedMs || now - derivedStartedMs < STRESS_MIN_WINDOW_MS ||
+      prvCount < 18) {
+    rejectStressEstimate(now);
+    return;
+  }
+
+  uint16_t window[PRV_HISTORY];
+  size_t count = 0;
+  uint32_t oldest = now, newest = 0;
+  const size_t start = (prvIndex + PRV_HISTORY - prvCount) % PRV_HISTORY;
+  for (size_t i = 0; i < prvCount; ++i) {
+    const size_t source = (start + i) % PRV_HISTORY;
+    if (now - prvTimes[source] > STRESS_WINDOW_MS) continue;
+    window[count++] = prvIntervals[source];
+    oldest = min(oldest, prvTimes[source]);
+    newest = max(newest, prvTimes[source]);
+  }
+  if (count < 18 || newest - oldest < 25000) {
+    rejectStressEstimate(now);
+    return;
+  }
+
+  uint16_t minimum = window[0], maximum = window[0];
+  double squaredDifferences = 0;
+  uint16_t bins[25] = {0};
+  for (size_t i = 0; i < count; ++i) {
+    minimum = min(minimum, window[i]);
+    maximum = max(maximum, window[i]);
+    const int bin = constrain((static_cast<int>(window[i]) - 300) / 50, 0, 24);
+    ++bins[bin];
+    if (i) {
+      const float difference = static_cast<float>(window[i]) - window[i - 1];
+      squaredDifferences += difference * difference;
+    }
+  }
+  size_t modeBin = 0;
+  for (size_t i = 1; i < 25; ++i) {
+    if (bins[i] > bins[modeBin]) modeBin = i;
+  }
+  const float modeSeconds = (325.0f + 50.0f * modeBin) / 1000.0f;
+  // El muestreo a 50 Hz cuantiza los intervalos en pasos de 20 ms. Un suelo
+  // de 50 ms evita dividir por cero sin convertir esa cuantizacion en precision.
+  const float rangeSeconds = max((maximum - minimum) / 1000.0f, 0.05f);
+  if (modeSeconds <= 0) return;
+  const float amplitudeOfMode = 100.0f * bins[modeBin] / count;
+  baevskyStressIndex = amplitudeOfMode /
+                       (2.0f * modeSeconds * rangeSeconds);
+  rmssdMs = sqrtf(squaredDifferences / (count - 1));
+
+  const float baevskyPercent = baevskyScoreToPercent(baevskyStressIndex);
+  const float cardiacScore =
+      0.75f * baevskyPercent + 0.25f * rmssdLoadPercent(rmssdMs);
+  stressUsesRespiration = respirationValid;
+  stressScore = stressUsesRespiration
+      ? 0.85f * cardiacScore +
+        0.15f * respirationLoadPercent(respirationRate)
+      : cardiacScore;
+  stressScore = constrain(stressScore, 0.0f, 100.0f);
+
+  const float spanSeconds = (newest - oldest) / 1000.0f;
+  const float durationEvidence = constrain(
+      50.0f + 50.0f * (spanSeconds - 25.0f) / 35.0f, 50.0f, 100.0f);
+  const float intervalEvidence = constrain(100.0f * count / 50.0f, 35.0f, 100.0f);
+  const float signalEvidence = constrain(derivedSignalEvidence(), 25.0f, 100.0f);
+  stressConfidence = 0.38f * durationEvidence +
+                     0.32f * intervalEvidence +
+                     0.30f * signalEvidence;
+  if (stressUsesRespiration) {
+    stressConfidence = 0.85f * stressConfidence +
+                       0.15f * respirationConfidence;
+  }
+  stressValid = stressConfidence >= 35.0f;
+  if (stressValid) stressLastSuccessMs = now;
+  if (!stressValid) {
+    stressState = "unavailable";
+  } else if (stressScore < 20.0f) {
+    stressState = "very_low";
+  } else if (stressScore < 40.0f) {
+    stressState = "low";
+  } else if (stressScore < 60.0f) {
+    stressState = "moderate";
+  } else if (stressScore < 80.0f) {
+    stressState = "high";
+  } else {
+    stressState = "very_high";
+  }
+}
+
+void updateDerivedMetrics(uint32_t now) {
+  // Solo los cambios duros de contexto descartan la ventana. Una lectura de BPM
+  // o calidad momentaneamente invalida no debe reiniciar un analisis de un minuto.
+  const bool eligible = calibrated && fingerPresent &&
+                        !calibrationRunning(phase) && !breathingRunning;
+  if (!eligible) {
+    resetDerivedAnalysis();
+    return;
+  }
+  if (!derivedCollecting) {
+    derivedCollecting = true;
+    derivedStartedMs = now;
+  }
+  if (++respirationDecimator >= RESPIRATION_DOWNSAMPLE) {
+    respirationDecimator = 0;
+    respirationFeatures[0][respirationIndex] = dcValue;
+    const size_t previous =
+        (respirationIndex + RESPIRATION_WINDOW - 1) % RESPIRATION_WINDOW;
+    respirationFeatures[1][respirationIndex] = latestPulseAmplitude > 0
+        ? latestPulseAmplitude
+        : respirationCount ? respirationFeatures[1][previous] : 0.0f;
+    respirationFeatures[2][respirationIndex] = latestAcceptedIbi
+        ? latestAcceptedIbi
+        : respirationCount ? respirationFeatures[2][previous] : 800.0f;
+    const float sampleQuality = bpmValid
+        ? signalQuality : 0.65f * signalQuality;
+    respirationSignalQuality[respirationIndex] = static_cast<uint8_t>(
+        constrain(sampleQuality, 0.0f, 100.0f));
+    respirationIndex = (respirationIndex + 1) % RESPIRATION_WINDOW;
+    if (respirationCount < RESPIRATION_WINDOW) ++respirationCount;
+  }
+  if (!lastDerivedUpdateMs || now - lastDerivedUpdateMs >= DERIVED_UPDATE_MS) {
+    lastDerivedUpdateMs = now;
+    estimateRespiration(now);
+    estimateStress(now);
+  }
+}
+
+void resetPulseAnalysis() {
+  memset(signalRing, 0, sizeof(signalRing));
+  signalIndex = signalCount = 0;
+  recentAmplitude = adaptiveThreshold = 0;
+  signalPeakLevel = noisePeakLevel = 0;
+  detectorPrevious2 = detectorPrevious1 = 0;
+  detectorPrevious1Ms = 0;
+  polarityLearningSamples = 0;
+  positiveEnvelope = negativeEnvelope = 0;
+  signalPolarity = 1;
+  ppgValue = 0;
+  peakThisSample = false;
+  lastPeakMs = 0;
+  lastReliablePulseMs = 0;
+  memset(ibis, 0, sizeof(ibis));
+  ibiCount = ibiIndex = 0;
+  bpmCurrent = bpmAverage = bpmSum = 0;
+  bpmAverageCount = 0;
+  bpmValid = bpmAverageReady = false;
+  signalQuality = 0;
+  resetDerivedAnalysis();
+}
+
+void setFinger(bool present, uint32_t now) {
+  if (fingerPresent == present) return;
+  fingerPresent = present;
+  fingerCandidate = present;
+  fingerCandidateSinceMs = now;
+  fingerPresentSinceMs = present ? now : 0;
+  resetPulseAnalysis();
+  if (!serialPlotterEnabled) Serial.println(present ? "FINGER_DETECTED" : "FINGER_REMOVED");
+}
+
+void beginCalibration(uint32_t now) {
+  calibrated = false;
+  phase = CalibrationPhase::PREPARE_FINGER;
+  phaseStartedMs = now;
+  phaseMessage = "Col·loca el dit quan acabi el compte enrere.";
+  fingerSampleCount = noFingerSampleCount = 0;
+  fingerMedian = noFingerMedian = fingerMad = noFingerMad = 0;
+  fingerMin = noFingerMin = ADC_MAX_VALUE;
+  fingerMax = noFingerMax = 0;
+  missedAtCalibrationStart = missedSamples;
+  setFinger(false, now);
+  resetPulseAnalysis();
+  if (!serialPlotterEnabled) Serial.println("CALIBRATION_STARTED");
+}
+
+void queueCalibrationLog(const char *result, uint16_t difference, uint16_t noise, uint32_t now) {
+  portENTER_CRITICAL(&stateMux);
+  pendingLog = {now, result, static_cast<uint16_t>(fingerSampleCount),
+                static_cast<uint16_t>(noFingerSampleCount), fingerMedian,
+                noFingerMedian, fingerMad, noFingerMad, fingerMin, fingerMax,
+                noFingerMin, noFingerMax, difference, noise,
+                missedSamples - missedAtCalibrationStart};
+  pendingLogReady = true;
+  portEXIT_CRITICAL(&stateMux);
+}
+
+void evaluateCalibration(uint32_t now) {
+  const char *result = "insufficient_samples";
+  uint16_t difference = 0;
+  uint32_t noise = 0;
+  bool valid = fingerSampleCount >= MIN_CALIBRATION_SAMPLES &&
+               noFingerSampleCount >= MIN_CALIBRATION_SAMPLES;
+  if (valid) {
+    fingerMedian = medianCopy(fingerSamples, fingerSampleCount);
+    noFingerMedian = medianCopy(noFingerSamples, noFingerSampleCount);
+    fingerMad = madOf(fingerSamples, fingerSampleCount, fingerMedian);
+    noFingerMad = madOf(noFingerSamples, noFingerSampleCount, noFingerMedian);
+    difference = abs(static_cast<int>(fingerMedian) - static_cast<int>(noFingerMedian));
+    noise = static_cast<uint32_t>(fingerMad) + noFingerMad;
+    const bool saturated = fingerMedian < 30 || noFingerMedian < 30 ||
+                           fingerMedian > ADC_MAX_VALUE - 30 || noFingerMedian > ADC_MAX_VALUE - 30;
+    if (saturated) {
+      valid = false;
+      result = "saturated";
+      phaseMessage = "Sensor saturat: revisa el divisor i utilitza només 3,3 V.";
+    } else if (difference < 12 || difference < 5UL * noise) {
+      valid = false;
+      result = "low_contrast";
+      phaseMessage = "Contrast insuficient: ajusta la llum, el dit o el divisor.";
+    } else {
+      result = "ok";
+      phaseMessage = "Mapatge vàlid. Col·loca el dit per mesurar el pols.";
+    }
+  } else {
+    phaseMessage = "Han faltat mostres; repeteix el calibratge.";
+  }
+  calibrated = valid;
+  phase = valid ? CalibrationPhase::COMPLETE : CalibrationPhase::FAILED;
+  phaseStartedMs = now;
+  dcInitialized = false;
+  resetPulseAnalysis();
+  const uint16_t loggedNoise =
+      noise > UINT16_MAX ? UINT16_MAX : static_cast<uint16_t>(noise);
+  queueCalibrationLog(result, difference, loggedNoise, now);
+  if (!serialPlotterEnabled) {
+    Serial.printf("CALIBRATION_%s finger=%u no_finger=%u mad=%u,%u samples=%u,%u\n",
+                  valid ? "OK" : "FAILED", fingerMedian, noFingerMedian,
+                  fingerMad, noFingerMad, fingerSampleCount, noFingerSampleCount);
+  }
+}
+
+void updateCalibration(uint32_t now) {
+  const uint32_t elapsed = now - phaseStartedMs;
+  switch (phase) {
+    case CalibrationPhase::PREPARE_FINGER:
+      if (elapsed >= PREPARE_MS) {
+        phase = CalibrationPhase::SAMPLE_FINGER;
+        phaseStartedMs = now;
+        phaseMessage = "Mantén el dit immòbil durant 10 segons.";
+      }
+      break;
+    case CalibrationPhase::SAMPLE_FINGER:
+      if (elapsed >= CALIBRATION_SAMPLE_MS) {
+        phase = CalibrationPhase::PREPARE_NO_FINGER;
+        phaseStartedMs = now;
+        phaseMessage = "Retira el dit quan acabi el compte enrere.";
+      }
+      break;
+    case CalibrationPhase::PREPARE_NO_FINGER:
+      if (elapsed >= PREPARE_MS) {
+        phase = CalibrationPhase::SAMPLE_NO_FINGER;
+        phaseStartedMs = now;
+        phaseMessage = "Mantén el fotoresistor lliure durant 10 segons.";
+      }
+      break;
+    case CalibrationPhase::SAMPLE_NO_FINGER:
+      if (elapsed >= CALIBRATION_SAMPLE_MS) evaluateCalibration(now);
+      break;
+    default: break;
+  }
+}
+
+void updateFinger(uint32_t now) {
+  if (!calibrated || calibrationRunning(phase)) return;
+  const int32_t denominator = static_cast<int32_t>(fingerMedian) - noFingerMedian;
+  if (!denominator) return;
+  const float presence = (dcValue - noFingerMedian) / denominator;
+  bool desired = fingerPresent;
+  bool triggered = false;
+  if (!fingerPresent && presence > 0.62f) { desired = true; triggered = true; }
+  else if (fingerPresent && presence < 0.38f) { desired = false; triggered = true; }
+  if (!triggered) {
+    fingerCandidate = fingerPresent;
+    fingerCandidateSinceMs = now;
+  } else if (fingerCandidate != desired) {
+    fingerCandidate = desired;
+    fingerCandidateSinceMs = now;
+  } else if (now - fingerCandidateSinceMs >= (desired ? 350UL : 1200UL)) {
+    setFinger(desired, now);
+  }
+}
+
+float minimumUsefulAmplitude() {
+  // La MAD con dedo contiene parte del propio pulso; la MAD sin dedo estima
+  // mejor el suelo de ruido optico/electrico del montaje.
+  const float calibratedNoise = max(1.0f, static_cast<float>(noFingerMad));
+  return max(MIN_SIGNAL_AMPLITUDE_ADC,
+             calibratedNoise * CALIBRATION_NOISE_MULTIPLIER);
+}
+
+const char *qualityStateName() {
+  if (!fingerPresent) return "no_finger";
+  if (recentAmplitude < minimumUsefulAmplitude()) return "weak_signal";
+  if (!bpmValid) return "stabilizing";
+  return "valid";
+}
+
+void updateSignalQuality() {
+  if (!fingerPresent) {
+    signalQuality = 0;
+    return;
+  }
+  const float minimum = minimumUsefulAmplitude();
+  const float amplitudeScore = constrain(50.0f * recentAmplitude / minimum, 0.0f, 100.0f);
+  const float regularityScore = ibiCount >= 3
+      ? constrain(100.0f * (1.0f - 4.0f * ibiVariation(medianIbi())), 0.0f, 100.0f)
+      : 25.0f * ibiCount;
+  const float evidenceScore = constrain(25.0f * ibiCount, 0.0f, 100.0f);
+  signalQuality = 0.45f * amplitudeScore + 0.40f * regularityScore +
+                  0.15f * evidenceScore;
+}
+
+bool acceptPeak(uint32_t peakMs, float peakAmplitude) {
+  if (!lastPeakMs) {
+    lastPeakMs = peakMs;
+    latestPulseAmplitude = peakAmplitude;
+    ++pulseAcceptedCount;
+    return true;
+  }
+
+  const uint32_t rawInterval = peakMs - lastPeakMs;
+  if (rawInterval < REFRACTORY_MS) {
+    ++pulseRejectedCount;
+    return false;
+  }
+  if (rawInterval > MAX_PEAK_GAP_MS) {
+    // Tras un hueco largo, este pico se convierte en el nuevo ancla. Se conserva
+    // el BPM mostrado durante su margen, pero no se inventa un intervalo.
+    lastPeakMs = peakMs;
+    latestPulseAmplitude = peakAmplitude;
+    ++pulseRejectedCount;
+    return true;
+  }
+
+  uint32_t interval = rawInterval;
+  uint8_t recoveredBeats = 0;
+  if (ibiCount >= 3) {
+    const float previousMedian = medianIbi();
+    const float lowerBound = previousMedian * (1.0f - IBI_OUTLIER_FRACTION);
+    const float upperBound = previousMedian * (1.0f + IBI_OUTLIER_FRACTION);
+    if (rawInterval < lowerBound) {
+      // Pico precoz: suele ser ruido o la incisura dicrótica. No cambia el ancla.
+      noisePeakLevel = 0.875f * noisePeakLevel + 0.125f * peakAmplitude;
+      ++pulseRejectedCount;
+      if (!serialPlotterEnabled) {
+        Serial.printf("PULSE_REJECTED ibi=%lu expected=%.0f reason=early\n",
+                      static_cast<unsigned long>(rawInterval), previousMedian);
+      }
+      return false;
+    }
+    if (rawInterval > upperBound) {
+      const uint8_t periods = constrain(
+          static_cast<int>(lroundf(rawInterval / previousMedian)), 2, 3);
+      const float corrected = static_cast<float>(rawInterval) / periods;
+      if (fabsf(corrected - previousMedian) <= previousMedian * 0.20f) {
+        interval = lroundf(corrected);
+        recoveredBeats = periods - 1;
+      } else {
+        // El pico parece real pero el intervalo no es fiable. Reanclar aquí evita
+        // que un solo rechazo convierta también el latido siguiente en un hueco.
+        lastPeakMs = peakMs;
+        latestPulseAmplitude = peakAmplitude;
+        ++pulseRejectedCount;
+        if (!serialPlotterEnabled) {
+          Serial.printf("PULSE_REJECTED ibi=%lu expected=%.0f reason=resync\n",
+                        static_cast<unsigned long>(rawInterval), previousMedian);
+        }
+        return true;
+      }
+    }
+  }
+  if (interval < REFRACTORY_MS || interval > MAX_IBI_MS) {
+    lastPeakMs = peakMs;
+    latestPulseAmplitude = peakAmplitude;
+    ++pulseRejectedCount;
+    return true;
+  }
+
+  lastPeakMs = peakMs;
+  latestPulseAmplitude = peakAmplitude;
+  ++pulseAcceptedCount;
+  pulseRecoveredCount += recoveredBeats;
+  ibis[ibiIndex] = interval;
+  ibiIndex = (ibiIndex + 1) % IBI_HISTORY;
+  if (ibiCount < IBI_HISTORY) ++ibiCount;
+  recordPrvInterval(interval, peakMs);
+
+  // La media recortada conserva la robustez de la mediana y reduce los saltos
+  // de cuantizacion de 20 ms propios del muestreo a 50 Hz.
+  const float targetBpm = 60000.0f / robustMeanIbi();
+  if (bpmCurrent > 0 && lastReliablePulseMs &&
+      peakMs - lastReliablePulseMs <= BPM_HOLD_MS) {
+    const float maximumStep = max(3.0f, bpmCurrent * 0.08f);
+    const float boundedTarget = constrain(
+        targetBpm, bpmCurrent - maximumStep, bpmCurrent + maximumStep);
+    bpmCurrent = 0.78f * bpmCurrent + 0.22f * boundedTarget;
+  } else {
+    bpmCurrent = targetBpm;
+  }
+  lastReliablePulseMs = peakMs;
+  bpmValid = ibiCount >= MIN_INTERVALS_FOR_BPM &&
+             peakMs - fingerPresentSinceMs >= 4000 &&
+             recentAmplitude >= minimumUsefulAmplitude();
+
+  const float instantBpm = 60000.0f / interval;
+  if (ibiCount >= 3 && fabsf(instantBpm - targetBpm) <= targetBpm * 0.25f) {
+    bpmSum += instantBpm;
+    ++bpmAverageCount;
+    bpmAverage = bpmSum / bpmAverageCount;
+  }
+  bpmAverageReady = bpmAverageCount >= MIN_INTERVALS_FOR_AVERAGE &&
+                    peakMs - fingerPresentSinceMs >= 10000;
+  if (!serialPlotterEnabled) {
+    Serial.printf("PULSE_OK ibi=%lu bpm=%.1f target=%.1f recovered=%u count=%u\n",
+                  static_cast<unsigned long>(interval), bpmCurrent, targetBpm,
+                  recoveredBeats, bpmAverageCount);
+  }
+  return true;
+}
+
+void updatePulse(float filtered, uint32_t now) {
+  peakThisSample = false;
+  if (!fingerPresent || calibrationRunning(phase)) {
+    ppgValue = filtered;
+    adaptiveThreshold = 0;
+    updateSignalQuality();
+    return;
+  }
+
+  // Aprende una unica orientacion para que el pulso dominante quede positivo.
+  // Solo invierte la PPG real; no sintetiza ni modifica su morfologia.
+  if (polarityLearningSamples < SAMPLE_RATE_HZ * 2) {
+    positiveEnvelope = max(positiveEnvelope * 0.995f, filtered);
+    negativeEnvelope = max(negativeEnvelope * 0.995f, -filtered);
+    ++polarityLearningSamples;
+    if (polarityLearningSamples == SAMPLE_RATE_HZ * 2) {
+      signalPolarity = positiveEnvelope >= negativeEnvelope ? 1 : -1;
+    }
+  }
+  ppgValue = filtered * signalPolarity;
+
+  signalRing[signalIndex] = ppgValue;
+  signalIndex = (signalIndex + 1) % SIGNAL_WINDOW;
+  if (signalCount < SIGNAL_WINDOW) ++signalCount;
+  float windowMinimum = signalRing[0], windowMaximum = signalRing[0];
+  for (size_t i = 1; i < signalCount; ++i) {
+    windowMinimum = min(windowMinimum, signalRing[i]);
+    windowMaximum = max(windowMaximum, signalRing[i]);
+  }
+  recentAmplitude = windowMaximum - windowMinimum;
+
+  const float minimum = minimumUsefulAmplitude();
+  if (signalPeakLevel <= 0) signalPeakLevel = max(minimum, 0.65f * recentAmplitude);
+  signalPeakLevel *= 0.999f;  // Permite seguir una amplitud que disminuye lentamente.
+  noisePeakLevel *= 0.999f;
+  adaptiveThreshold = max(0.18f * minimum,
+      noisePeakLevel + ADAPTIVE_THRESHOLD_FRACTION *
+      max(0.0f, signalPeakLevel - noisePeakLevel));
+
+  const bool localMaximum = detectorPrevious1 > detectorPrevious2 &&
+                            detectorPrevious1 >= ppgValue;
+  if (localMaximum) {
+    const bool settled = now - fingerPresentSinceMs >= DETECTOR_SETTLE_MS;
+    const bool enoughAmplitude = signalCount == SIGNAL_WINDOW &&
+                                 recentAmplitude >= minimum;
+    if (settled && enoughAmplitude && detectorPrevious1 > adaptiveThreshold) {
+      if (acceptPeak(detectorPrevious1Ms, detectorPrevious1)) {
+        peakThisSample = true;
+        signalPeakLevel = 0.875f * signalPeakLevel +
+                          0.125f * detectorPrevious1;
+      }
+    } else if (detectorPrevious1 > 0) {
+      noisePeakLevel = 0.95f * noisePeakLevel + 0.05f * detectorPrevious1;
+    }
+  }
+  detectorPrevious2 = detectorPrevious1;
+  detectorPrevious1 = ppgValue;
+  detectorPrevious1Ms = now;
+
+  if (lastReliablePulseMs && now - lastReliablePulseMs > BPM_HOLD_MS) {
+    bpmValid = false;
+  }
+  if (lastPeakMs && now - lastPeakMs > MAX_PEAK_GAP_MS) {
+    lastPeakMs = 0;
+  }
+  updateSignalQuality();
+}
+
+uint16_t readAveragedAdc() {
+  uint32_t sum = 0;
+  uint16_t smallest = ADC_MAX_VALUE;
+  uint16_t largest = 0;
+  for (uint8_t i = 0; i < ADC_OVERSAMPLES; ++i) {
+    const uint16_t sample = analogRead(SENSOR_PIN);
+    sum += sample;
+    smallest = min(smallest, sample);
+    largest = max(largest, sample);
+  }
+  return static_cast<uint16_t>((sum - smallest - largest) /
+                               (ADC_OVERSAMPLES - 2));
+}
+
+void publishState() {
+  portENTER_CRITICAL(&stateMux);
+  publicState.raw = rawValue;
+  publicState.filtered = ppgValue;
+  publicState.calibrated = calibrated;
+  publicState.finger = fingerPresent;
+  publicState.phase = phase;
+  publicState.phaseStartedMs = phaseStartedMs;
+  publicState.calibrationMessage = phaseMessage;
+  publicState.bpmCurrent = bpmCurrent;
+  publicState.bpmAverage = bpmAverage;
+  publicState.bpmValid = bpmValid;
+  publicState.bpmAverageReady = bpmAverageReady;
+  publicState.beatCount = bpmAverageCount;
+  publicState.pulseAccepted = pulseAcceptedCount;
+  publicState.pulseRejected = pulseRejectedCount;
+  publicState.pulseRecovered = pulseRecoveredCount;
+  publicState.quality = signalQuality;
+  publicState.qualityState = qualityStateName();
+  publicState.respirationRate = respirationRate;
+  publicState.respirationConfidence = respirationConfidence;
+  publicState.respirationWindowSeconds =
+      static_cast<float>(respirationCount) / RESPIRATION_SAMPLE_HZ;
+  publicState.respirationValid = respirationValid;
+  publicState.respirationSources = respirationSources;
+  publicState.stressScore = stressScore;
+  publicState.stressConfidence = stressConfidence;
+  publicState.stressWindowSeconds = derivedStartedMs
+      ? min(static_cast<float>(millis() - derivedStartedMs) / 1000.0f, 60.0f)
+      : 0;
+  publicState.rmssdMs = rmssdMs;
+  publicState.baevskyStressIndex = baevskyStressIndex;
+  publicState.stressValid = stressValid;
+  publicState.stressUsesRespiration = stressUsesRespiration;
+  publicState.stressState = stressState;
+  publicState.threshold = adaptiveThreshold;
+  publicState.peak = peakThisSample;
+  publicState.samples = totalSamples;
+  publicState.missed = missedSamples;
+  graphRing[graphIndex] = ppgValue;
+  graphIndex = (graphIndex + 1) % GRAPH_HISTORY;
+  if (graphCount < GRAPH_HISTORY) ++graphCount;
+  portEXIT_CRITICAL(&stateMux);
+}
+
+void samplingTask(void *) {
+  TickType_t wake = xTaskGetTickCount();
+  for (;;) {
+    vTaskDelayUntil(&wake, pdMS_TO_TICKS(SAMPLE_PERIOD_MS));
+    const uint64_t nowUs = esp_timer_get_time();
+    if (lastSampleUs) {
+      const uint64_t elapsed = nowUs - lastSampleUs;
+      if (elapsed > 30000) missedSamples += elapsed / 20000 - 1;
+    }
+    lastSampleUs = nowUs;
+    const uint32_t now = millis();
+    if (calibrationStartRequested && !calibrationRunning(phase)) {
+      calibrationStartRequested = false;
+      beginCalibration(now);
+    }
+    updateCalibration(now);
+
+    rawValue = readAveragedAdc();
+    if (!dcInitialized) { dcValue = rawValue; dcInitialized = true; }
+    else dcValue += 0.06f * (rawValue - dcValue);
+    if (phase == CalibrationPhase::SAMPLE_FINGER && fingerSampleCount < CALIBRATION_CAPACITY) {
+      fingerSamples[fingerSampleCount++] = rawValue;
+      fingerMin = min(fingerMin, rawValue); fingerMax = max(fingerMax, rawValue);
+    } else if (phase == CalibrationPhase::SAMPLE_NO_FINGER && noFingerSampleCount < CALIBRATION_CAPACITY) {
+      noFingerSamples[noFingerSampleCount++] = rawValue;
+      noFingerMin = min(noFingerMin, rawValue); noFingerMax = max(noFingerMax, rawValue);
+    }
+    filteredValue = lowPass.process(highPass.process(rawValue));
+    updateFinger(now);
+    updatePulse(filteredValue, now);
+    updateDerivedMetrics(now);
+    ++totalSamples;
+    publishState();
+    if (serialPlotterEnabled) {
+      const float marker = peakThisSample ? max(adaptiveThreshold * 1.5f, ppgValue) : 0;
+      Serial.printf("PPG:%.2f\tThreshold:%.2f\tPeak:%.2f\n",
+                    ppgValue, adaptiveThreshold, marker);
+    }
+  }
+}
+
+void ensureLogFile() {
+  if (!filesystemReady || LittleFS.exists(LOG_PATH)) return;
+  File file = LittleFS.open(LOG_PATH, FILE_WRITE);
+  if (!file) return;
+  file.println("# calibration.log - Keyestudio ESP32 PLUS / GPIO34");
+  file.println("# uptime_ms;result;finger_count;no_finger_count;finger_median;no_finger_median;finger_mad;no_finger_mad;finger_min;finger_max;no_finger_min;no_finger_max;difference;robust_noise;missed");
+  file.close();
+}
+
+void flushPendingLog() {
+  CalibrationLogEntry entry;
+  bool ready = false;
+  portENTER_CRITICAL(&stateMux);
+  if (pendingLogReady) { entry = pendingLog; pendingLogReady = false; ready = true; }
+  portEXIT_CRITICAL(&stateMux);
+  if (!ready || !filesystemReady) return;
+  if (LittleFS.exists(LOG_PATH)) {
+    File current = LittleFS.open(LOG_PATH, FILE_READ);
+    const size_t size = current ? current.size() : 0;
+    if (current) current.close();
+    if (size > MAX_LOG_BYTES) {
+      LittleFS.remove(LOG_OLD_PATH);
+      LittleFS.rename(LOG_PATH, LOG_OLD_PATH);
+    }
+  }
+  ensureLogFile();
+  File file = LittleFS.open(LOG_PATH, FILE_APPEND);
+  if (!file) return;
+  file.printf("%lu;%s;%u;%u;%u;%u;%u;%u;%u;%u;%u;%u;%u;%u;%lu\n",
+              static_cast<unsigned long>(entry.uptimeMs), entry.result,
+              entry.fingerCount, entry.noFingerCount, entry.fingerMedian,
+              entry.noFingerMedian, entry.fingerMad, entry.noFingerMad,
+              entry.fingerMin, entry.fingerMax, entry.noFingerMin,
+              entry.noFingerMax, entry.difference, entry.robustNoise,
+              static_cast<unsigned long>(entry.missed));
+  file.close();
+  if (!serialPlotterEnabled) Serial.printf("LOG_SAVED result=%s\n", entry.result);
+}
+
+void handleState() {
+  const uint32_t now = millis();
+  updateBreathingPattern(now);
+  PublicState state;
+  float signal[GRAPH_HISTORY];
+  size_t count, index, sendCount;
+  const uint32_t since = server.hasArg("since")
+                             ? strtoul(server.arg("since").c_str(), nullptr, 10)
+                             : 0;
+  portENTER_CRITICAL(&stateMux);
+  state = publicState;
+  count = graphCount;
+  index = graphIndex;
+  sendCount = count;
+  if (since && state.samples >= since) {
+    sendCount = min<size_t>(count, state.samples - since);
+  }
+  for (size_t i = 0; i < sendCount; ++i) {
+    signal[i] = graphRing[(index + GRAPH_HISTORY - sendCount + i) % GRAPH_HISTORY];
+  }
+  portEXIT_CRITICAL(&stateMux);
+  String json;
+  json.reserve(5000);
+  json = "{\"raw\":" + String(state.raw) + ",\"signal\":[";
+  for (size_t i = 0; i < sendCount; ++i) { if (i) json += ','; json += String(signal[i], 2); }
+  json += "],\"seq\":" + String(state.samples);
+  json += ",\"calibrated\":" + String(state.calibrated ? "true" : "false");
+  json += ",\"finger\":" + String(state.finger ? "true" : "false");
+  json += ",\"calibrating\":" + String(calibrationRunning(state.phase) ? "true" : "false");
+  json += ",\"phase\":\"" + String(phaseName(state.phase)) + "\"";
+  json += ",\"progress\":" + String(phaseProgress(state.phase, state.phaseStartedMs, millis()));
+  json += ",\"cal_message\":\"" + String(state.calibrationMessage) + "\"";
+  json += ",\"bpm\":" + String(state.bpmCurrent, 1);
+  json += ",\"bpm_valid\":" + String(state.bpmValid ? "true" : "false");
+  json += ",\"bpm_average\":" + String(state.bpmAverage, 1);
+  json += ",\"bpm_average_ready\":" + String(state.bpmAverageReady ? "true" : "false");
+  json += ",\"beats\":" + String(state.beatCount);
+  json += ",\"pulse_accepted\":" + String(state.pulseAccepted);
+  json += ",\"pulse_rejected\":" + String(state.pulseRejected);
+  json += ",\"pulse_recovered\":" + String(state.pulseRecovered);
+  json += ",\"quality\":" + String(state.quality, 1);
+  json += ",\"quality_state\":\"" + String(state.qualityState) + "\"";
+  json += ",\"respiration_rate\":" + String(state.respirationRate, 1);
+  json += ",\"respiration_valid\":" + String(state.respirationValid ? "true" : "false");
+  json += ",\"respiration_sources\":" + String(state.respirationSources);
+  json += ",\"respiration_confidence\":" + String(state.respirationConfidence, 1);
+  json += ",\"respiration_window_s\":" + String(state.respirationWindowSeconds, 1);
+  json += ",\"stress_score\":" + String(state.stressScore, 1);
+  json += ",\"stress_valid\":" + String(state.stressValid ? "true" : "false");
+  json += ",\"stress_uses_respiration\":" +
+          String(state.stressUsesRespiration ? "true" : "false");
+  json += ",\"stress_confidence\":" + String(state.stressConfidence, 1);
+  json += ",\"stress_state\":\"" + String(state.stressState) + "\"";
+  json += ",\"stress_window_s\":" + String(state.stressWindowSeconds, 1);
+  json += ",\"rmssd_ms\":" + String(state.rmssdMs, 1);
+  json += ",\"baevsky_si\":" + String(state.baevskyStressIndex, 1);
+  json += ",\"threshold\":" + String(state.threshold, 2);
+  json += ",\"peak\":" + String(state.peak ? "true" : "false");
+  json += ",\"missed\":" + String(state.missed);
+  json += ",\"simulated\":false";
+  json += ",\"firmware\":\"" + String(FIRMWARE_VERSION) + "\"";
+  json += ",\"breathing_running\":" + String(breathingRunning ? "true" : "false");
+  json += ",\"breathing_elapsed_ms\":" + String(breathingRunning ? now - breathingStartedMs : 0);
+  json += ",\"breathing_phase\":" + String(breathingPhase);
+  json += ",\"breathing_phase_elapsed_ms\":" + String(breathingRunning ? now - breathingPhaseStartedMs : 0);
+  json += ",\"motor_on\":" + String(motorOn ? "true" : "false");
+  json += ",\"ip\":\"" + WiFi.softAPIP().toString() + "\"}";
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "application/json", json);
+}
+
+void handleCalibrate() {
+  PublicState state;
+  portENTER_CRITICAL(&stateMux);
+  state = publicState;
+  const bool accepted = !calibrationRunning(state.phase) && !calibrationStartRequested;
+  if (accepted) calibrationStartRequested = true;
+  portEXIT_CRITICAL(&stateMux);
+  server.send(accepted ? 202 : 409, "application/json",
+              accepted ? "{\"accepted\":true}" : "{\"accepted\":false}");
+}
+
+void handleBreathing() {
+  bool accepted = false;
+  portENTER_CRITICAL(&stateMux);
+  if (!breathingRunning && !breathingStartRequested) {
+    breathingStartRequested = true;
+    accepted = true;
+  }
+  portEXIT_CRITICAL(&stateMux);
+  server.send(accepted ? 202 : 409, "application/json",
+              accepted ? "{\"accepted\":true}" : "{\"accepted\":false}");
+}
+
+void handleLogDownload() {
+  if (!filesystemReady || !LittleFS.exists(LOG_PATH)) {
+    server.send(404, "text/plain", "No calibration log yet");
+    return;
+  }
+  File file = LittleFS.open(LOG_PATH, FILE_READ);
+  server.sendHeader("Content-Disposition", "attachment; filename=\"calibration.log\"");
+  server.streamFile(file, "text/plain");
+  file.close();
+}
+
+void serviceSerial() {
+  while (Serial.available()) {
+    const char c = Serial.read();
+    if (c == '\r') continue;
+    if (c == '\n') {
+      serialCommand[serialCommandLength] = 0;
+      if (!strcmp(serialCommand, "LOGS")) {
+        if (filesystemReady && LittleFS.exists(LOG_PATH)) {
+          File file = LittleFS.open(LOG_PATH, FILE_READ);
+          while (file && file.available()) Serial.write(file.read());
+          if (file) file.close();
+        } else Serial.println("NO_LOG_FILE");
+        Serial.println("LOG_DUMP_END");
+      } else if (!strcmp(serialCommand, "CALIBRATE")) {
+        if (!calibrationRunning(phase)) {
+          calibrationStartRequested = true;
+          Serial.println("CALIBRATION_REQUESTED");
+        } else Serial.println("CALIBRATION_BUSY");
+      } else if (!strcmp(serialCommand, "PLOT ON") || !strcmp(serialCommand, "PLOT_ON")) {
+        serialPlotterEnabled = true;
+        if (preferencesReady) preferences.putBool("plotter", true);
+      } else if (!strcmp(serialCommand, "PLOT OFF") || !strcmp(serialCommand, "PLOT_OFF")) {
+        serialPlotterEnabled = false;
+        if (preferencesReady) preferences.putBool("plotter", false);
+        Serial.println("PLOTTER_DISABLED");
+      } else if (!strcmp(serialCommand, "HELP")) {
+        Serial.println("COMMANDS CALIBRATE LOGS PLOT_ON PLOT_OFF HELP");
+      }
+      serialCommandLength = 0;
+    } else if (serialCommandLength + 1 < sizeof(serialCommand)) {
+      serialCommand[serialCommandLength++] = toupper(c);
+    }
+  }
+}
+
+// ====================== PANTALLA OLED ======================
+// Tres estados derivados exclusivamente de la telemetria real. El trazado
+// inferior es un icono animado, NO un ECG ni la senal PPG adquirida.
+uint8_t oledMode(const PublicState &s) {
+  if (!s.calibrated || calibrationRunning(s.phase)) return 0;
+  if (!s.finger || !s.bpmValid || !isfinite(s.bpmCurrent) ||
+      s.bpmCurrent <= 0) return 1;
+  return 2;
+}
+
+void oledHeart(int cx, int cy, int r) {
+  oled.fillCircle(cx - r, cy - r / 2, r, SSD1306_WHITE);
+  oled.fillCircle(cx + r, cy - r / 2, r, SSD1306_WHITE);
+  oled.fillTriangle(cx - 2 * r, cy, cx + 2 * r, cy,
+                    cx, cy + 2 * r, SSD1306_WHITE);
+}
+
+void oledFinger(uint32_t now) {
+  const int bob = static_cast<int>(sinf(now * 0.004f));
+  const int y = 2 + bob;
+  // Indice extendido, una, nudillos y palma; toque sobre la base del sensor.
+  oled.drawRoundRect(108, y, 8, 18, 3, SSD1306_WHITE);
+  oled.drawRoundRect(110, y + 2, 4, 5, 1, SSD1306_WHITE);
+  oled.fillRoundRect(103, y + 13, 20, 11, 3, SSD1306_WHITE);
+  oled.drawRoundRect(102, 28, 22, 4, 1, SSD1306_WHITE);
+  if ((now / 350) % 2) {
+    oled.drawLine(98, 22, 101, 25, SSD1306_WHITE);
+    oled.drawLine(123, 25, 126, 22, SSD1306_WHITE);
+  }
+}
+
+void oledLargeMessage(const char *message, uint32_t elapsed) {
+  // Letras 10x14 (celda 12x16) en una zona de 96 px, dejando el icono libre.
+  // Pausas al principio/final para poder leer la frase completa sin abreviarla.
+  const int width = strlen(message) * 12;
+  const int travel = max(0, width - 96);
+  const uint32_t scrollMs = travel * 35;
+  const uint32_t t = elapsed % (3600 + scrollMs);
+  const int offset = t < 1800 ? 0 : min(travel, static_cast<int>((t - 1800) / 35));
+  oled.setTextSize(2);
+  oled.setCursor(-offset, 8);
+  oled.print(message);
+  oled.fillRect(96, 0, 32, 32, SSD1306_BLACK);
+}
+
+float oledPulseShape(float p) {
+  // Trazo estilizado para el icono: pico grande y pequeno valle.
+  if (p < 0.12f) return -p / 0.12f * 3;
+  if (p < 0.24f) return -3 + (p - 0.12f) / 0.12f * 15;
+  if (p < 0.38f) return 12 - (p - 0.24f) / 0.14f * 18;
+  if (p < 0.53f) return -6 + (p - 0.38f) / 0.15f * 6;
+  return 0;
+}
+
+void renderOled(const PublicState &s, uint32_t now) {
+  oled.clearDisplay();
+  oled.setTextWrap(false);
+  oled.setTextColor(SSD1306_WHITE);
+  oled.setTextSize(1);
+  const uint8_t mode = oledMode(s);
+  static uint8_t previousMode = 255;
+  static CalibrationPhase previousPhase = CalibrationPhase::IDLE;
+  static uint32_t messageStarted = 0;
+  if (previousMode != mode || previousPhase != s.phase) {
+    messageStarted = now;
+    previousMode = mode;
+    previousPhase = s.phase;
+  }
+  if (mode == 0) {
+    if (calibrationRunning(s.phase)) {
+      const bool remove = s.phase == CalibrationPhase::PREPARE_NO_FINGER ||
+                          s.phase == CalibrationPhase::SAMPLE_NO_FINGER;
+      oled.setTextSize(2);
+      oled.setCursor(0, 0); oled.print(remove ? "Remove" : "Place");
+      oled.setCursor(0, 16); oled.print("finger");
+    } else {
+      oledLargeMessage("Make the calibration first", now - messageStarted);
+    }
+    oledFinger(now);
+  } else if (mode == 1) {
+    oled.setTextSize(2);
+    oled.setCursor(0, 0); oled.print("No BPM");
+    oled.setCursor(0, 16); oled.print("detected");
+    // Movimiento lento de reposo; no pretende indicar un latido detectado.
+    const int bob = static_cast<int>(sinf(now * TWO_PI / 4000.0f));
+    oledHeart(112, 11 + bob, 6);
+    oled.drawFastHLine(105, 10 + bob, 4, SSD1306_BLACK);
+    oled.drawFastHLine(115, 10 + bob, 4, SSD1306_BLACK);
+    for (int x = 98; x < 128; ++x) {
+      oled.drawPixel(x, 28 + static_cast<int>(sinf(x * 0.2f - now * 0.001f)),
+                     SSD1306_WHITE);
+    }
+  } else {
+    const int bpm = constrain(static_cast<int>(lroundf(s.bpmCurrent)), 1, 999);
+    char text[4];
+    snprintf(text, sizeof(text), "%d", bpm);
+    const int width = strlen(text) * 24;
+    oled.setTextSize(4);
+    oled.setCursor(0, 2); oled.print(text);
+    oled.setTextSize(1);
+    oled.setCursor(1 + width, 22); oled.print("bpm");
+    // La animacion sigue el BPM valido; no genera ni modifica medidas.
+    const float period = 60000.0f / s.bpmCurrent;
+    const float p = fmodf(static_cast<float>(now), period) / period;
+    const float beat = p < 0.32f ? sinf(p / 0.32f * PI) : 0;
+    oledHeart(112, 10, 5 + static_cast<int>(2 * beat));
+    int previousY = 27;
+    for (int x = 98; x < 128; ++x) {
+      const float phase = fmodf(p + (127 - x) / 30.0f, 1.0f);
+      const int y = 27 - static_cast<int>(oledPulseShape(phase) / 3);
+      if (x > 98) oled.drawLine(x - 1, previousY, x, y, SSD1306_WHITE);
+      previousY = y;
+    }
+  }
+  oled.display();
+}
+
+void oledTask(void *) {
+  TickType_t wake = xTaskGetTickCount();
+  for (;;) {
+    PublicState state;
+    portENTER_CRITICAL(&stateMux);
+    state = publicState;
+    portEXIT_CRITICAL(&stateMux);
+    renderOled(state, millis());
+    vTaskDelayUntil(&wake, pdMS_TO_TICKS(OLED_FRAME_MS));
+  }
+}
+
+void setupOled() {
+  Wire.begin(OLED_SDA, OLED_SCL);
+  Wire.setClock(400000);
+  Wire.setTimeOut(20);
+  // begin() de Adafruit no verifica presencia: comprobar ACK primero.
+  for (uint8_t address = 0x3C; address <= 0x3D; ++address) {
+    Wire.beginTransmission(address);
+    if (Wire.endTransmission() == 0) { oledAddress = address; break; }
+  }
+  if (!oledAddress || !oled.begin(SSD1306_SWITCHCAPVCC, oledAddress, false, false)) {
+    Serial.println("OLED_UNAVAILABLE check_SDA21_SCL22_and_SSD1306");
+    return;
+  }
+  oled.setRotation(OLED_ROTATION);
+  oled.clearDisplay();
+  oled.display();
+  oledReady = xTaskCreatePinnedToCore(oledTask, "oled-ui", 4096, nullptr,
+                                    1, nullptr, 0) == pdPASS;
+  Serial.printf("OLED_%s address=0x%02X size=128x32 rotation=180 fps=20\n",
+                oledReady ? "READY" : "TASK_FAILED", oledAddress);
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(250);
+  preferencesReady = preferences.begin("ppg", false);
+  if (preferencesReady) serialPlotterEnabled = preferences.getBool("plotter", false);
+  pinMode(SENSOR_PIN, INPUT);
+  pinMode(MOTOR_PIN, OUTPUT);
+  setMotor(false);
+  analogReadResolution(12);
+  analogSetPinAttenuation(SENSOR_PIN, ADC_11db);
+  filesystemReady = LittleFS.begin(true);
+  ensureLogFile();
+
+  WiFi.mode(WIFI_AP);
+  WiFi.setSleep(false);
+  const bool ap = WiFi.softAP(AP_SSID, AP_PASSWORD);
+  server.on("/", HTTP_GET, [] {
+    server.sendHeader("Cache-Control", "no-store");
+    server.send_P(200, "text/html; charset=utf-8", HTML_PAGE);
+  });
+  server.on("/api/state", HTTP_GET, handleState);
+  server.on("/api/calibrate", HTTP_POST, handleCalibrate);
+  server.on("/api/breathing", HTTP_POST, handleBreathing);
+  server.on("/logs/calibration.log", HTTP_GET, handleLogDownload);
+  server.onNotFound([] { server.send(404, "text/plain", "Not found"); });
+  server.begin();
+
+  xTaskCreatePinnedToCore(samplingTask, "ppg-sampler", 8192, nullptr, 3, nullptr, 1);
+  setupOled();
+  if (!serialPlotterEnabled) {
+    Serial.printf("FIRMWARE %s web_bytes=%u\n", FIRMWARE_VERSION, static_cast<unsigned>(sizeof(HTML_PAGE) - 1));
+    Serial.printf("BOOT board=keyestudio-esp32-plus gpio=%u littlefs=%s\n", SENSOR_PIN, filesystemReady ? "ready" : "failed");
+    Serial.printf("AP_%s ssid=%s ip=%s\n", ap ? "READY" : "FAILED", AP_SSID, WiFi.softAPIP().toString().c_str());
+    Serial.println("SERIAL_COMMANDS CALIBRATE LOGS PLOT_ON PLOT_OFF HELP");
+  }
+}
+
+void loop() {
+  updateBreathingPattern(millis());
+  server.handleClient();
+  flushPendingLog();
+  serviceSerial();
+  updateBreathingPattern(millis());
+  static uint32_t lastHealth = 0;
+  if (!serialPlotterEnabled && millis() - lastHealth >= 5000) {
+    lastHealth = millis();
+    PublicState state;
+    portENTER_CRITICAL(&stateMux);
+    state = publicState;
+    portEXIT_CRITICAL(&stateMux);
+    Serial.printf("HEALTH ap=%u samples=%lu missed=%lu raw=%u heap=%u oled=%u oled_mode=%u bpm=%.1f valid=%u\n",
+                  WiFi.softAPgetStationNum(), static_cast<unsigned long>(state.samples),
+                  static_cast<unsigned long>(state.missed), state.raw, ESP.getFreeHeap(),
+                  oledReady, oledMode(state), state.bpmCurrent, state.bpmValid);
+  }
+  delay(1);
+}
