@@ -53,7 +53,7 @@ constexpr uint32_t DERIVED_RESULT_GRACE_MS = 15000;
 constexpr size_t PRV_HISTORY = 220;
 // ===================================================================
 
-constexpr char FIRMWARE_VERSION[] = "leire-tdr-web-1.4.1-oled32";
+constexpr char FIRMWARE_VERSION[] = "leire-tdr-web-1.7.0-44-live";
 
 constexpr char AP_SSID[] = "fotopletismografia";
 constexpr char AP_PASSWORD[] = "12345678";
@@ -267,19 +267,37 @@ char serialCommand[24];
 size_t serialCommandLength = 0;
 
 // ====================== BIOFEEDBACK MOTOR ======================
-// Patron: 4 s continuo -> 7 s con pulsos de ~0,5 s -> 8 s continuo.
-constexpr uint32_t MOTOR_PHASE1_MS = 4000;
-constexpr uint32_t MOTOR_PHASE2_MS = 7000;
-constexpr uint32_t MOTOR_PHASE3_MS = 8000;
-constexpr uint32_t MOTOR_INTERVAL_MS = 1000;
-constexpr uint32_t MOTOR_PULSE_MS = 500;
+// Guia 4-4 durante aproximadamente un minuto (ocho ciclos):
+//   inspira: doble vibracion; expira: una vibracion.
+// Las vibraciones solo anuncian el cambio de fase; el motor permanece apagado
+// durante el resto de cada intervalo para no enmascarar la medida PPG.
+constexpr uint32_t BREATHING_PHASE_MS = 4000;
+constexpr uint32_t BREATHING_CYCLE_MS = 2 * BREATHING_PHASE_MS;
+constexpr uint8_t BREATHING_CYCLES = 8;
+constexpr uint32_t BREATHING_TOTAL_MS = BREATHING_CYCLES * BREATHING_CYCLE_MS;
+constexpr uint32_t MOTOR_PULSE_MS = 180;
+constexpr uint32_t MOTOR_PULSE_GAP_MS = 140;
+constexpr uint32_t POST_ANALYSIS_MIN_MS = 32000;
+constexpr uint32_t DURING_SAMPLE_MS = 1000;
+constexpr uint8_t DURING_MIN_SAMPLES = 8;
 
 volatile bool breathingStartRequested = false;
 volatile bool breathingRunning = false;
+volatile bool postAnalysisPulseResetRequested = false;
 uint8_t breathingPhase = 0;
 uint32_t breathingStartedMs = 0;
 uint32_t breathingPhaseStartedMs = 0;
 bool motorOn = false;
+bool postAnalysisRunning = false;
+bool comparisonReady = false;
+uint32_t postAnalysisStartedMs = 0;
+float beforeBpm = 0, beforeRespiration = 0, beforeStress = 0;
+float duringBpm = 0, duringRespiration = 0, duringStress = 0;
+float afterBpm = 0, afterRespiration = 0, afterStress = 0;
+float duringBpmSum = 0, duringRespirationSum = 0, duringStressSum = 0;
+uint16_t duringSampleCount = 0;
+uint32_t lastDuringSampleMs = 0;
+bool duringMeasurementReady = false;
 
 void setMotor(bool on) {
   motorOn = on;
@@ -291,6 +309,11 @@ void startBreathingPattern(uint32_t now) {
   breathingPhase = 1;
   breathingStartedMs = now;
   breathingPhaseStartedMs = now;
+  duringBpm = duringRespiration = duringStress = 0;
+  duringBpmSum = duringRespirationSum = duringStressSum = 0;
+  duringSampleCount = 0;
+  lastDuringSampleMs = 0;
+  duringMeasurementReady = false;
   setMotor(true);
 }
 
@@ -310,29 +333,62 @@ void updateBreathingPattern(uint32_t now) {
 
   // Un reloj absoluto evita que las peticiones web acumulen retraso entre fases.
   const uint32_t elapsed = now - breathingStartedMs;
-  if (elapsed >= MOTOR_PHASE1_MS + MOTOR_PHASE2_MS + MOTOR_PHASE3_MS) {
+  if (elapsed >= BREATHING_TOTAL_MS) {
     stopBreathingPattern();
+    if (duringSampleCount) {
+      duringBpm = duringBpmSum / duringSampleCount;
+      duringRespiration = duringRespirationSum / duringSampleCount;
+      duringStress = duringStressSum / duringSampleCount;
+      duringMeasurementReady = duringSampleCount >= DURING_MIN_SAMPLES;
+    }
+    // El muestreador reiniciara tambien los intervalos de pulso. Asi la
+    // medicion posterior no reutiliza ningun latido de la linea base.
+    postAnalysisPulseResetRequested = true;
+    postAnalysisRunning = true;
+    postAnalysisStartedMs = now;
     return;
   }
-  if (elapsed < MOTOR_PHASE1_MS) {
-    breathingPhase = 1;
-    breathingPhaseStartedMs = breathingStartedMs;
-    setMotor(true);
-  } else if (elapsed < MOTOR_PHASE1_MS + MOTOR_PHASE2_MS) {
-    breathingPhase = 2;
-    breathingPhaseStartedMs = breathingStartedMs + MOTOR_PHASE1_MS;
-    setMotor((elapsed - MOTOR_PHASE1_MS) % MOTOR_INTERVAL_MS < MOTOR_PULSE_MS);
-  } else {
-    breathingPhase = 3;
-    breathingPhaseStartedMs = breathingStartedMs + MOTOR_PHASE1_MS + MOTOR_PHASE2_MS;
-    setMotor(true);
-  }
+  const uint32_t cycleElapsed = elapsed % BREATHING_CYCLE_MS;
+  const uint8_t phase = cycleElapsed < BREATHING_PHASE_MS ? 1 : 2;
+  const uint32_t phaseElapsed =
+      cycleElapsed - static_cast<uint32_t>(phase - 1) * BREATHING_PHASE_MS;
+  breathingPhase = phase;
+  breathingPhaseStartedMs = now - phaseElapsed;
+
+  const bool doubleCue = phase == 1;
+  const uint32_t secondPulseStart = MOTOR_PULSE_MS + MOTOR_PULSE_GAP_MS;
+  const bool firstPulse = phaseElapsed < MOTOR_PULSE_MS;
+  const bool secondPulse = doubleCue && phaseElapsed >= secondPulseStart &&
+                           phaseElapsed < secondPulseStart + MOTOR_PULSE_MS;
+  setMotor(firstPulse || secondPulse);
 }
 
-// Generado por scripts/build_web.py. Edita los archivos de web/.
-// Fuentes DM Serif Display y DM Sans: SIL Open Font License (web/fonts/).
-#pragma once
-#include <Arduino.h>
+void collectBreathingMeasurement(uint32_t now) {
+  if (!breathingRunning ||
+      (lastDuringSampleMs && now - lastDuringSampleMs < DURING_SAMPLE_MS))
+    return;
+  lastDuringSampleMs = now;
+
+  PublicState state;
+  portENTER_CRITICAL(&stateMux);
+  state = publicState;
+  portEXIT_CRITICAL(&stateMux);
+  if (!state.finger || !state.bpmValid || !state.respirationValid ||
+      !state.stressValid)
+    return;
+
+  duringBpmSum += state.bpmCurrent;
+  duringRespirationSum += state.respirationRate;
+  duringStressSum += state.stressScore;
+  ++duringSampleCount;
+  duringBpm = duringBpmSum / duringSampleCount;
+  duringRespiration = duringRespirationSum / duringSampleCount;
+  duringStress = duringStressSum / duringSampleCount;
+  duringMeasurementReady = duringSampleCount >= DURING_MIN_SAMPLES;
+}
+
+// Web incrustada directamente para que este .ino sea autocontenido.
+// Fuentes DM Serif Display y DM Sans: SIL Open Font License.
 
 const char HTML_PAGE[] PROGMEM = R"HTML(<!doctype html>
 <html lang="ca">
@@ -340,7 +396,7 @@ const char HTML_PAGE[] PROGMEM = R"HTML(<!doctype html>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="theme-color" content="#fcf9f4">
-  <meta name="description" content="Pols, respiracions per minut, estrès fisiològic estimat i respiració guiada 4–7–8.">
+  <meta name="description" content="Pols, respiracions per minut, estrès fisiològic estimat i respiració guiada 4–4.">
   <title>Fotopletismografia · El teu pols, en temps real.</title>
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 48 48'%3E%3Crect width='48' height='48' rx='12' fill='%230b4386'/%3E%3Cpath d='M6 31C14 31 13 12 19 12S23 29 28 24s4 7 14 7' fill='none' stroke='%23fcf9f4' stroke-width='3' stroke-linecap='round'/%3E%3C/svg%3E">
   <style>@font-face {
@@ -627,7 +683,7 @@ h1 {
   opacity: 0.65;
 }
 .signal-panel {
-  height: 304px;
+  height: 350px;
   background: var(--sand);
   border: 1px solid var(--line);
   border-radius: 12px;
@@ -683,6 +739,35 @@ h1 {
     16.666666% 100%,
     100% 16.666666%;
 }
+.plot-shell {
+  flex: 1;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: 22px 48px minmax(0, 1fr);
+  gap: 7px;
+}
+.y-axis-title {
+  writing-mode: vertical-rl;
+  transform: rotate(180deg);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.1;
+  text-align: center;
+}
+.y-axis-values {
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  align-items: flex-end;
+  padding: 0 0 1px;
+  color: var(--muted);
+  font-size: 14px;
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+}
 canvas {
   display: block;
   width: 100%;
@@ -691,9 +776,16 @@ canvas {
 .time-axis {
   display: flex;
   justify-content: space-between;
-  margin: 7px -5px 0;
+  margin: 7px -5px 0 77px;
   font-size: 18px;
   line-height: 1.25;
+}
+.x-axis-title {
+  margin-left: 77px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.1;
+  text-align: center;
 }
 .controls-grid {
   display: grid;
@@ -969,14 +1061,103 @@ canvas {
 .breathing-clock > span:last-child {
   font-size: 20px;
 }
-.breathing-content > .button {
+.breathing-action {
+  justify-self: end;
+  width: 236px;
+  max-width: 100%;
+  text-align: center;
+}
+.breathing-action > .button {
   padding-inline: 15px;
   margin-bottom: 20px;
-  width: 216px;
-  max-width: 100%;
-  justify-self: end;
+  width: 100%;
   font-size: 19px;
 }
+.breathing-readiness {
+  min-height: 36px;
+  margin: -8px 0 0;
+  color: #ffffffc9;
+  font-size: 13px;
+  line-height: 1.35;
+}
+.breathing-progress {
+  margin-top: 14px;
+}
+.breathing-progress-label {
+  display: flex;
+  justify-content: space-between;
+  gap: 14px;
+  margin-bottom: 7px;
+  color: #ffffffe6;
+  font-size: 14px;
+  font-variant-numeric: tabular-nums;
+}
+.breathing-progress-track {
+  height: 10px;
+  overflow: hidden;
+  border: 1px solid #ffffff58;
+  border-radius: 999px;
+  background: #072e5b99;
+}
+.breathing-progress-track span {
+  display: block;
+  width: 0;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, #f5d57b, #ffffff);
+  transition: width 0.2s linear;
+}
+.cycle-markers {
+  display: grid;
+  grid-template-columns: repeat(8, 1fr);
+  gap: 8px;
+  margin-top: 8px;
+}
+.cycle-markers span {
+  height: 4px;
+  border-radius: 999px;
+  background: #ffffff38;
+}
+.cycle-markers span.is-complete,
+.cycle-markers span.is-active {
+  background: var(--paper);
+}
+.breathing-comparison {
+  margin-top: 16px;
+  padding-top: 14px;
+  border-top: 1px solid #ffffff4d;
+}
+.breathing-comparison h3 {
+  margin: 0 0 10px;
+  font-family: Editorial, Georgia, serif;
+  font-size: 24px;
+  font-weight: 500;
+}
+.comparison-grid {
+  display: grid;
+  grid-template-columns: minmax(105px, 1.2fr) repeat(4, minmax(64px, 1fr));
+  align-items: center;
+  gap: 6px 12px;
+  font-size: 14px;
+  font-variant-numeric: tabular-nums;
+}
+.comparison-grid .comparison-head {
+  color: #ffffffa8;
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.comparison-grid strong {
+  font-size: 17px;
+  font-weight: 500;
+}
+.comparison-note {
+  margin: 10px 0 0;
+  color: #ffffffad;
+  font-size: 12px;
+}
+.comparison-delta[data-direction='down'] { color: #bdebbf; }
+.comparison-delta[data-direction='up'] { color: #ffe09a; }
 .action-message {
   margin: 12px 0 0;
   font-size: 16px;
@@ -1079,7 +1260,7 @@ footer > span {
     grid-row: 1 / 3;
     margin-top: -15px;
   }
-  .breathing-content > .button {
+  .breathing-action {
     grid-column: 1;
     grid-row: 2;
     margin: 0;
@@ -1218,7 +1399,7 @@ footer > span {
     grid-column: auto;
     margin-top: -26px;
   }
-  .breathing-content > .button {
+  .breathing-action {
     grid-column: auto;
     grid-row: auto;
     margin-bottom: 12px;
@@ -1357,7 +1538,7 @@ footer > span {
   }
   .signal-panel {
     padding: 14px 14px 12px;
-    height: 278px;
+    height: 316px;
     border-radius: 11px;
   }
   .signal-header {
@@ -1382,7 +1563,21 @@ footer > span {
   }
   .time-axis {
     font-size: 12px;
-    margin-top: 9px;
+    margin: 9px -3px 0 63px;
+  }
+  .plot-shell {
+    grid-template-columns: 18px 38px minmax(0, 1fr);
+    gap: 4px;
+  }
+  .y-axis-title,
+  .x-axis-title {
+    font-size: 10px;
+  }
+  .y-axis-values {
+    font-size: 11px;
+  }
+  .x-axis-title {
+    margin-left: 63px;
   }
   .controls-grid {
     gap: 18px;
@@ -1499,11 +1694,31 @@ footer > span {
   .breathing-clock > span:last-child {
     font-size: 15px;
   }
-  .breathing-content > .button {
+  .breathing-action {
     grid-column: 1/-1;
     grid-row: auto;
     margin: 0;
     width: 100%;
+  }
+  .breathing-action > .button {
+    margin-bottom: 12px;
+  }
+  .breathing-readiness {
+    min-height: 0;
+  }
+  .breathing-progress-label {
+    font-size: 12px;
+  }
+  .comparison-grid {
+    grid-template-columns: minmax(72px, 1.1fr) repeat(4, minmax(45px, 1fr));
+    gap: 7px 5px;
+    font-size: 12px;
+  }
+  .comparison-grid strong {
+    font-size: 14px;
+  }
+  .comparison-grid .comparison-head {
+    font-size: 9px;
   }
   footer {
     font-size: 12px;
@@ -1565,7 +1780,7 @@ footer > span {
     height: 190px;
     margin-top: -12px;
   }
-  .breathing-content > .button {
+  .breathing-action > .button {
     font-size: 17px;
     width: 100%;
   }
@@ -1604,8 +1819,9 @@ footer > span {
       </section>
       <section class="signal-panel" aria-labelledby="signal-heading">
         <div class="signal-header"><div><h2 id="signal-heading">Senyal de pols</h2><p>Últims 6 segons</p></div><span class="legend"><i aria-hidden="true"></i>PPG (senyal)</span></div>
-        <div class="plot-area"><canvas id="plot" role="img" aria-label="Gràfic del senyal de fotopletismografia durant els últims sis segons"></canvas></div>
+        <div class="plot-shell"><div class="y-axis-title" aria-hidden="true">Amplitud PPG filtrada (unitats ADC)</div><div class="y-axis-values" aria-hidden="true"><span id="y-axis-max">+1</span><span>0</span><span id="y-axis-min">−1</span></div><div class="plot-area"><canvas id="plot" role="img" aria-label="Gràfic de l’amplitud PPG filtrada en unitats ADC durant els últims sis segons"></canvas></div></div>
         <div class="time-axis" aria-hidden="true"><span>−6 s</span><span>−5 s</span><span>−4 s</span><span>−3 s</span><span>−2 s</span><span>−1 s</span><span>0 s</span></div>
+        <div class="x-axis-title">Temps (s)</div>
       </section>
       <div class="controls-grid">
         <section class="calibration-panel" aria-labelledby="calibration-heading">
@@ -1619,12 +1835,14 @@ footer > span {
           <div class="calibration-actions"><button class="button button-blue" id="calibrate" type="button" disabled>Iniciar el calibratge</button><a class="download" id="download" href="/logs/calibration.log" download="calibration.log"><svg class="icon" aria-hidden="true"><use href="#icon-download"/></svg><span>Descarregar el registre</span></a></div>
         </section>
         <section class="breathing-panel" aria-labelledby="breathing-heading">
-          <h2 id="breathing-heading">Respiració 4–7–8</h2>
+          <h2 id="breathing-heading">Respiració 4–4</h2>
           <div class="breathing-content">
-            <ol class="breathing-phases"><li data-phase="1"><span class="phase-icon"><svg class="icon" aria-hidden="true"><use href="#icon-inhale"/></svg></span><span>Inspira 4 s</span></li><li data-phase="2"><span class="phase-icon"><svg class="icon" aria-hidden="true"><use href="#icon-hold"/></svg></span><span>Mantén 7 s</span></li><li data-phase="3"><span class="phase-icon"><svg class="icon" aria-hidden="true"><use href="#icon-exhale"/></svg></span><span>Expira 8 s</span></li></ol>
+            <ol class="breathing-phases"><li data-phase="1"><span class="phase-icon"><svg class="icon" aria-hidden="true"><use href="#icon-inhale"/></svg></span><span>Inspira 4 s</span></li><li data-phase="2"><span class="phase-icon"><svg class="icon" aria-hidden="true"><use href="#icon-exhale"/></svg></span><span>Expira 4 s</span></li></ol>
             <div class="breathing-orbit" id="breathing-orbit"><div class="orbit-inner"></div><div class="orbit-dotted"></div><div class="orbit-hand" id="orbit-hand"><span></span></div><div class="breathing-clock" role="timer" aria-label="Temporitzador de respiració"><span id="breathing-seconds">4</span><span id="breathing-phase">Inspira</span></div></div>
-            <button class="button button-white" id="breathing" type="button" disabled>Iniciar la respiració</button>
+            <div class="breathing-action"><button class="button button-white" id="breathing" type="button" disabled>Iniciar la respiració</button><p class="breathing-readiness" id="breathing-readiness">Cal una mesura vàlida de pols, respiració i estrès.</p></div>
           </div>
+          <div class="breathing-progress" id="breathing-progress"><div class="breathing-progress-label"><span id="breathing-progress-label">Preparació de la mesura inicial</span><span id="breathing-progress-percent">0%</span></div><div class="breathing-progress-track" id="breathing-progress-track" role="progressbar" aria-label="Progrés de la sessió de respiració" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><span id="breathing-progress-fill"></span></div><div class="cycle-markers" id="cycle-markers" aria-label="Vuit cicles de respiració"><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span></div></div>
+          <div class="breathing-comparison" id="breathing-comparison" hidden><h3>Abans, durant i després</h3><div class="comparison-grid"><span></span><span class="comparison-head">Abans</span><span class="comparison-head">Durant</span><span class="comparison-head">Després</span><span class="comparison-head">Canvi final</span><span>BPM</span><strong id="before-bpm">—</strong><strong id="during-bpm">—</strong><strong id="after-bpm">—</strong><strong class="comparison-delta" id="delta-bpm">—</strong><span>Respiració</span><strong id="before-respiration">—</strong><strong id="during-respiration">—</strong><strong id="after-respiration">—</strong><strong class="comparison-delta" id="delta-respiration">—</strong><span>Estrès</span><strong id="before-stress">—</strong><strong id="during-stress">—</strong><strong id="after-stress">—</strong><strong class="comparison-delta" id="delta-stress">—</strong></div><p class="comparison-note" id="comparison-note"></p></div>
           <span class="sr-only" id="breathing-announcement" role="status"></span>
         </section>
       </div>
@@ -1661,14 +1879,38 @@ footer > span {
       'breathing-orbit',
       'orbit-hand',
       'breathing-announcement',
+      'breathing-readiness',
+      'breathing-progress',
+      'breathing-progress-label',
+      'breathing-progress-percent',
+      'breathing-progress-track',
+      'breathing-progress-fill',
+      'cycle-markers',
+      'breathing-comparison',
+      'before-bpm',
+      'during-bpm',
+      'after-bpm',
+      'delta-bpm',
+      'before-respiration',
+      'during-respiration',
+      'after-respiration',
+      'delta-respiration',
+      'before-stress',
+      'during-stress',
+      'after-stress',
+      'delta-stress',
+      'comparison-note',
       'action-message',
+      'y-axis-max',
+      'y-axis-min',
     ].map((id) => [id, $(id)]),
   );
   const phases = [
     { name: 'Inspira', duration: 4, start: 0 },
-    { name: 'Mantén', duration: 7, start: 4 },
-    { name: 'Expira', duration: 8, start: 11 },
+    { name: 'Expira', duration: 4, start: 4 },
   ];
+  const breathingCycleSeconds = 8;
+  const breathingSessionSeconds = 64;
   const reducedMotion = matchMedia('(prefers-reduced-motion: reduce)');
   const canvas = $('plot');
   const context = canvas.getContext('2d');
@@ -1691,7 +1933,7 @@ footer > span {
   // Only a locally accepted breathing command is remembered; no readings are synthesized here.
   try {
     const saved = Number(sessionStorage.getItem('ppg-breathing-start'));
-    if (saved > Date.now() - 19000 && saved <= Date.now())
+    if (saved > Date.now() - breathingSessionSeconds * 1000 && saved <= Date.now())
       breathingStartedAt = saved;
   } catch (_) {
     /* Storage may be disabled in an embedded browser. */
@@ -1750,8 +1992,15 @@ footer > span {
   function refreshButtons() {
     ui.calibrate.disabled =
       !connected || calibratePending || Boolean(currentState?.calibrating);
+    const breathingBusy =
+      Boolean(currentState?.breathing_running) ||
+      Boolean(currentState?.post_analysis_running);
     ui.breathing.disabled =
-      !connected || breathingPending || Boolean(breathingStartedAt);
+      !connected ||
+      breathingPending ||
+      breathingBusy ||
+      currentState?.breathing_ready !== true;
+    ui.calibrate.disabled = ui.calibrate.disabled || breathingBusy;
     ui.calibrate.textContent = calibratePending
       ? 'Iniciant…'
       : currentState?.calibrating
@@ -1759,9 +2008,92 @@ footer > span {
         : 'Iniciar el calibratge';
     ui.breathing.textContent = breathingPending
       ? 'Iniciant…'
-      : breathingStartedAt
+      : currentState?.post_analysis_running
+        ? 'Analitzant el resultat…'
+        : breathingStartedAt
         ? 'Respiració en curs'
         : 'Iniciar la respiració';
+  }
+
+  function signedChange(after, before, unit = '') {
+    const change = Math.round((after - before) * 10) / 10;
+    const sign = change > 0 ? '+' : change < 0 ? '−' : '';
+    return `${sign}${Math.abs(change).toLocaleString('ca-ES', { maximumFractionDigits: 1 })}${unit}`;
+  }
+
+  function renderBreathingStudy(state) {
+    const messages = {
+      needs_calibration: 'Primer cal completar el calibratge.',
+      needs_finger: 'Col·loca el dit i mantén-lo quiet.',
+      needs_bpm: 'Esperant una mesura vàlida de BPM.',
+      needs_respiration: 'Mesurant la respiració inicial (uns 32 s).',
+      needs_stress: 'Calculant l’estrès fisiològic inicial.',
+      ready: 'Mesura inicial preparada. Ja pots començar.',
+      running: 'Segueix la guia i mantén el dit sobre el sensor.',
+      analyzing: 'Mantén el dit quiet mentre mesurem el resultat final.',
+    };
+    ui['breathing-readiness'].textContent =
+      messages[state.breathing_status] || 'Preparant la sessió.';
+
+    let progress = 0;
+    let label = 'Preparació de la mesura inicial';
+    let activeCycle = -1;
+    if (state.breathing_running) {
+      const total = Math.max(1, Number(state.breathing_total_ms) || 64000);
+      const cycles = Math.max(1, Number(state.breathing_cycles) || 8);
+      progress = Math.min(100, (Number(state.breathing_elapsed_ms) || 0) * 100 / total);
+      activeCycle = Math.max(0, Math.min(cycles - 1, (Number(state.breathing_cycle) || 1) - 1));
+      label = `Cicle ${activeCycle + 1} de ${cycles}`;
+    } else if (state.post_analysis_running) {
+      const target = Math.max(1, Number(state.post_analysis_target_ms) || 32000);
+      progress = Math.min(100, (Number(state.post_analysis_elapsed_ms) || 0) * 100 / target);
+      label = progress >= 100
+        ? 'Validant la qualitat del senyal final'
+        : 'Analitzant després de la respiració';
+    } else if (state.comparison_ready) {
+      progress = 100;
+      label = 'Comparativa completada';
+    }
+    const roundedProgress = Math.round(progress);
+    ui['breathing-progress-label'].textContent = label;
+    ui['breathing-progress-percent'].textContent = `${roundedProgress}%`;
+    ui['breathing-progress-fill'].style.width = `${progress}%`;
+    ui['breathing-progress-track'].setAttribute(
+      'aria-valuenow',
+      String(roundedProgress),
+    );
+    [...ui['cycle-markers'].children].forEach((marker, index) => {
+      marker.classList.toggle(
+        'is-complete',
+        Boolean(state.post_analysis_running || state.comparison_ready) ||
+          (state.breathing_running && index < activeCycle),
+      );
+      marker.classList.toggle(
+        'is-active',
+        Boolean(state.breathing_running && index === activeCycle),
+      );
+    });
+
+    ui['breathing-comparison'].hidden = state.comparison_ready !== true;
+    if (!state.comparison_ready) return;
+    const values = [
+      ['bpm', state.before_bpm, state.during_bpm, state.after_bpm, ''],
+      ['respiration', state.before_respiration, state.during_respiration, state.after_respiration, ''],
+      ['stress', state.before_stress, state.during_stress, state.after_stress, '%'],
+    ];
+    values.forEach(([name, before, during, after, unit]) => {
+      ui[`before-${name}`].textContent = `${Math.round(before)}${unit}`;
+      ui[`during-${name}`].textContent = state.during_measurement_ready
+        ? `${Math.round(during)}${unit}`
+        : '—';
+      ui[`after-${name}`].textContent = `${Math.round(after)}${unit}`;
+      const delta = ui[`delta-${name}`];
+      delta.textContent = signedChange(after, before, unit);
+      delta.dataset.direction = after < before ? 'down' : after > before ? 'up' : 'same';
+    });
+    ui['comparison-note'].textContent = state.during_measurement_ready
+      ? `La columna «Durant» resumeix ${Number(state.during_samples) || 0} lectures vàlides preses mentre feies la tècnica.`
+      : 'No hi ha prou lectures vàlides durant la tècnica; la comparativa inicial i final es conserva.';
   }
 
   function renderCalibration(state) {
@@ -1837,13 +2169,11 @@ footer > span {
     const respirationValid =
       state.finger &&
       !state.calibrating &&
-      !state.breathing_running &&
       state.respiration_valid === true &&
       Number.isFinite(state.respiration_rate);
     const stressValid =
       state.finger &&
       !state.calibrating &&
-      !state.breathing_running &&
       state.stress_valid === true &&
       Number.isFinite(state.stress_score);
     if (respirationValid)
@@ -1853,10 +2183,10 @@ footer > span {
       0,
       Math.min(32, Math.floor(Number(state.respiration_window_s) || 0)),
     );
-    ui['respiration-detail'].textContent = state.breathing_running
-      ? 'En pausa durant la guia'
+    ui['respiration-detail'].textContent = state.post_analysis_running
+        ? `Mesura final ${respirationWindow}/32 s`
       : respirationValid
-        ? `${Math.max(1, Number(state.respiration_sources) || 1)}/3 senyals · Confiança ${Math.round(state.respiration_confidence)}%`
+        ? `${state.breathing_running ? 'En directe · ' : ''}${Math.max(1, Number(state.respiration_sources) || 1)}/3 senyals · Confiança ${Math.round(state.respiration_confidence)}%`
         : state.finger
           ? `Analitzant ${respirationWindow}/32 s`
           : 'Esperant un senyal estable';
@@ -1868,9 +2198,9 @@ footer > span {
       very_high: 'Molt alt',
     };
     ui['stress-detail'].textContent = stressValid
-      ? `Fisiològic · ${stressLabels[state.stress_state] || 'Estimat'} · ${state.stress_uses_respiration ? 'Pols + resp.' : 'Pols/PRV'}`
-      : state.breathing_running
-        ? 'En pausa durant la guia'
+      ? `${state.breathing_running ? 'En directe · ' : ''}Fisiològic · ${stressLabels[state.stress_state] || 'Estimat'} · ${state.stress_uses_respiration ? 'Pols + resp.' : 'Pols/PRV'}`
+      : state.post_analysis_running
+          ? `Mesura final ${Math.min(30, Math.floor(Number(state.stress_window_s) || 0))}/30 s`
         : state.finger
           ? `Analitzant ${Math.min(30, Math.floor(Number(state.stress_window_s) || 0))}/30 s`
           : 'Esperant el dit';
@@ -1911,6 +2241,7 @@ footer > span {
       breathingStartedAt = nextStart;
       rememberBreathing();
     }
+    renderBreathingStudy(state);
     refreshButtons();
   }
 
@@ -1932,7 +2263,11 @@ footer > span {
 
   function drawSignal(now) {
     context.clearRect(0, 0, width, height);
-    if (samples.length < 2 || !width || !height) return;
+    if (samples.length < 2 || !width || !height) {
+      ui['y-axis-max'].textContent = '+1';
+      ui['y-axis-min'].textContent = '−1';
+      return;
+    }
     const extent = samples.reduce(
       (largest, sample) => Math.max(largest, Math.abs(sample.value)),
       0,
@@ -1940,6 +2275,10 @@ footer > span {
     const target = Math.max(0.5, extent * 1.08);
     // Fit every peak immediately; ease back only when the signal becomes smaller.
     scale = target > scale ? target : scale + (target - scale) * 0.008;
+    const axisDecimals = scale < 10 ? 1 : 0;
+    const axisValue = scale.toFixed(axisDecimals).replace('.', ',');
+    ui['y-axis-max'].textContent = `+${axisValue}`;
+    ui['y-axis-min'].textContent = `−${axisValue}`;
     // One packet of latency lets real 50 Hz samples move continuously between HTTP responses.
     const drift =
       connected && !reducedMotion.matches
@@ -1982,19 +2321,21 @@ footer > span {
     let elapsed = breathingStartedAt
       ? (Date.now() - breathingStartedAt) / 1000
       : 0;
-    if (elapsed >= 19) {
+    if (elapsed >= breathingSessionSeconds) {
       breathingStartedAt = 0;
       elapsed = 0;
       rememberBreathing();
-      ui['breathing-announcement'].textContent = 'Respiració completada.';
+      ui['breathing-announcement'].textContent =
+        'Respiració completada. Analitzant la mesura final.';
       refreshButtons();
     }
     const running = Boolean(breathingStartedAt);
-    const phaseIndex = elapsed < 4 ? 0 : elapsed < 11 ? 1 : 2;
+    const cycleElapsed = elapsed % breathingCycleSeconds;
+    const phaseIndex = cycleElapsed < 4 ? 0 : 1;
     const phase = phases[phaseIndex];
     const seconds = Math.max(
       1,
-      Math.ceil(phase.duration - (elapsed - phase.start)),
+      Math.ceil(phase.duration - (cycleElapsed - phase.start)),
     );
     ui['breathing-seconds'].textContent = running ? seconds : '4';
     ui['breathing-phase'].textContent = running ? phase.name : 'Inspira';
@@ -2002,15 +2343,13 @@ footer > span {
       .closest('section')
       .classList.toggle('is-running', running);
     ui['orbit-hand'].style.transform =
-      `rotate(${running && !reducedMotion.matches ? (elapsed / 19) * 360 : 0}deg)`;
+      `rotate(${running && !reducedMotion.matches ? (cycleElapsed / breathingCycleSeconds) * 360 : 0}deg)`;
     const expansion =
       !running || reducedMotion.matches
         ? 1
         : phaseIndex === 0
-          ? 0.88 + (elapsed / 4) * 0.2
-          : phaseIndex === 1
-            ? 1.08
-            : 1.08 - ((elapsed - 11) / 8) * 0.2;
+          ? 0.88 + (cycleElapsed / 4) * 0.2
+          : 1.08 - ((cycleElapsed - 4) / 4) * 0.2;
     ui['breathing-orbit'].querySelector('.orbit-dotted').style.transform =
       `scale(${expansion})`;
     document
@@ -2071,6 +2410,8 @@ footer > span {
       showMessage(
         error.status === 409
           ? 'Ja hi ha una respiració en curs.'
+          : error.status === 422
+            ? 'Espera que el dit, els BPM, la respiració i l’estrès tinguin una mesura vàlida.'
           : 'No s’ha pogut iniciar la respiració. Comprova la connexió i torna-ho a provar.',
       );
     } finally {
@@ -2599,10 +2940,11 @@ void estimateStress(uint32_t now) {
 }
 
 void updateDerivedMetrics(uint32_t now) {
-  // Solo los cambios duros de contexto descartan la ventana. Una lectura de BPM
-  // o calidad momentaneamente invalida no debe reiniciar un analisis de un minuto.
+  // La respiracion guiada forma parte de la medicion: se mantienen activas las
+  // ventanas de respiracion y estres durante todo el ejercicio. Solo los cambios
+  // duros de contexto descartan el analisis.
   const bool eligible = calibrated && fingerPresent &&
-                        !calibrationRunning(phase) && !breathingRunning;
+                        !calibrationRunning(phase);
   if (!eligible) {
     resetDerivedAnalysis();
     return;
@@ -3072,6 +3414,11 @@ void samplingTask(void *) {
       beginCalibration(now);
     }
     updateCalibration(now);
+    if (postAnalysisPulseResetRequested) {
+      postAnalysisPulseResetRequested = false;
+      resetPulseAnalysis();
+      if (!serialPlotterEnabled) Serial.println("POST_ANALYSIS_STARTED");
+    }
 
     rawValue = readAveragedAdc();
     if (!dcInitialized) { dcValue = rawValue; dcInitialized = true; }
@@ -3136,9 +3483,52 @@ void flushPendingLog() {
   if (!serialPlotterEnabled) Serial.printf("LOG_SAVED result=%s\n", entry.result);
 }
 
+bool breathingBaselineReady(const PublicState &state) {
+  return state.calibrated && state.finger && !calibrationRunning(state.phase) &&
+         state.bpmValid && state.respirationValid && state.stressValid;
+}
+
+const char *breathingStatus(const PublicState &state) {
+  if (breathingRunning || breathingStartRequested) return "running";
+  if (postAnalysisRunning) return "analyzing";
+  if (!state.calibrated || calibrationRunning(state.phase)) return "needs_calibration";
+  if (!state.finger) return "needs_finger";
+  if (!state.bpmValid) return "needs_bpm";
+  if (!state.respirationValid) return "needs_respiration";
+  if (!state.stressValid) return "needs_stress";
+  return "ready";
+}
+
+void updatePostBreathingAnalysis(uint32_t now) {
+  if (!postAnalysisRunning || now - postAnalysisStartedMs < POST_ANALYSIS_MIN_MS)
+    return;
+  PublicState state;
+  portENTER_CRITICAL(&stateMux);
+  state = publicState;
+  portEXIT_CRITICAL(&stateMux);
+  if (!breathingBaselineReady(state)) return;
+
+  afterBpm = state.bpmCurrent;
+  afterRespiration = state.respirationRate;
+  afterStress = state.stressScore;
+  comparisonReady = true;
+  postAnalysisRunning = false;
+  if (!serialPlotterEnabled) {
+    Serial.printf(
+        "BREATHING_COMPARISON before_bpm=%.1f during_bpm=%.1f after_bpm=%.1f "
+        "before_rpm=%.1f during_rpm=%.1f after_rpm=%.1f "
+        "before_stress=%.1f during_stress=%.1f after_stress=%.1f samples=%u\n",
+        beforeBpm, duringBpm, afterBpm, beforeRespiration, duringRespiration,
+        afterRespiration, beforeStress, duringStress, afterStress,
+        duringSampleCount);
+  }
+}
+
 void handleState() {
   const uint32_t now = millis();
+  collectBreathingMeasurement(now);
   updateBreathingPattern(now);
+  updatePostBreathingAnalysis(now);
   PublicState state;
   float signal[GRAPH_HISTORY];
   size_t count, index, sendCount;
@@ -3201,6 +3591,39 @@ void handleState() {
   json += ",\"breathing_elapsed_ms\":" + String(breathingRunning ? now - breathingStartedMs : 0);
   json += ",\"breathing_phase\":" + String(breathingPhase);
   json += ",\"breathing_phase_elapsed_ms\":" + String(breathingRunning ? now - breathingPhaseStartedMs : 0);
+  json += ",\"breathing_ready\":" +
+          String(breathingBaselineReady(state) && !breathingRunning &&
+                         !breathingStartRequested && !postAnalysisRunning
+                     ? "true"
+                     : "false");
+  json += ",\"breathing_status\":\"" + String(breathingStatus(state)) + "\"";
+  json += ",\"breathing_cycle\":" +
+          String(breathingRunning
+                     ? min<uint8_t>(BREATHING_CYCLES,
+                                    (now - breathingStartedMs) /
+                                            BREATHING_CYCLE_MS +
+                                        1)
+                     : 0);
+  json += ",\"breathing_cycles\":" + String(BREATHING_CYCLES);
+  json += ",\"breathing_total_ms\":" + String(BREATHING_TOTAL_MS);
+  json += ",\"post_analysis_running\":" +
+          String(postAnalysisRunning ? "true" : "false");
+  json += ",\"post_analysis_elapsed_ms\":" +
+          String(postAnalysisRunning ? now - postAnalysisStartedMs : 0);
+  json += ",\"post_analysis_target_ms\":" + String(POST_ANALYSIS_MIN_MS);
+  json += ",\"comparison_ready\":" + String(comparisonReady ? "true" : "false");
+  json += ",\"before_bpm\":" + String(beforeBpm, 1);
+  json += ",\"before_respiration\":" + String(beforeRespiration, 1);
+  json += ",\"before_stress\":" + String(beforeStress, 1);
+  json += ",\"during_measurement_ready\":" +
+          String(duringMeasurementReady ? "true" : "false");
+  json += ",\"during_samples\":" + String(duringSampleCount);
+  json += ",\"during_bpm\":" + String(duringBpm, 1);
+  json += ",\"during_respiration\":" + String(duringRespiration, 1);
+  json += ",\"during_stress\":" + String(duringStress, 1);
+  json += ",\"after_bpm\":" + String(afterBpm, 1);
+  json += ",\"after_respiration\":" + String(afterRespiration, 1);
+  json += ",\"after_stress\":" + String(afterStress, 1);
   json += ",\"motor_on\":" + String(motorOn ? "true" : "false");
   json += ",\"ip\":\"" + WiFi.softAPIP().toString() + "\"}";
   server.sendHeader("Cache-Control", "no-store");
@@ -3211,7 +3634,9 @@ void handleCalibrate() {
   PublicState state;
   portENTER_CRITICAL(&stateMux);
   state = publicState;
-  const bool accepted = !calibrationRunning(state.phase) && !calibrationStartRequested;
+  const bool accepted = !calibrationRunning(state.phase) &&
+                        !calibrationStartRequested && !breathingRunning &&
+                        !breathingStartRequested && !postAnalysisRunning;
   if (accepted) calibrationStartRequested = true;
   portEXIT_CRITICAL(&stateMux);
   server.send(accepted ? 202 : 409, "application/json",
@@ -3220,14 +3645,27 @@ void handleCalibrate() {
 
 void handleBreathing() {
   bool accepted = false;
+  bool busy = false;
+  PublicState state;
   portENTER_CRITICAL(&stateMux);
-  if (!breathingRunning && !breathingStartRequested) {
+  state = publicState;
+  busy = breathingRunning || breathingStartRequested || postAnalysisRunning;
+  if (!busy && breathingBaselineReady(state)) {
+    beforeBpm = state.bpmCurrent;
+    beforeRespiration = state.respirationRate;
+    beforeStress = state.stressScore;
+    afterBpm = afterRespiration = afterStress = 0;
+    comparisonReady = false;
     breathingStartRequested = true;
     accepted = true;
   }
   portEXIT_CRITICAL(&stateMux);
-  server.send(accepted ? 202 : 409, "application/json",
-              accepted ? "{\"accepted\":true}" : "{\"accepted\":false}");
+  const int status = accepted ? 202 : busy ? 409 : 422;
+  server.send(status, "application/json",
+              accepted
+                  ? "{\"accepted\":true}"
+                  : busy ? "{\"accepted\":false,\"reason\":\"busy\"}"
+                         : "{\"accepted\":false,\"reason\":\"baseline\"}");
 }
 
 void handleLogDownload() {
@@ -3465,11 +3903,17 @@ void setup() {
 }
 
 void loop() {
-  updateBreathingPattern(millis());
+  uint32_t now = millis();
+  collectBreathingMeasurement(now);
+  updateBreathingPattern(now);
+  updatePostBreathingAnalysis(now);
   server.handleClient();
   flushPendingLog();
   serviceSerial();
-  updateBreathingPattern(millis());
+  now = millis();
+  collectBreathingMeasurement(now);
+  updateBreathingPattern(now);
+  updatePostBreathingAnalysis(now);
   static uint32_t lastHealth = 0;
   if (!serialPlotterEnabled && millis() - lastHealth >= 5000) {
     lastHealth = millis();
@@ -3479,7 +3923,8 @@ void loop() {
     portEXIT_CRITICAL(&stateMux);
     Serial.printf("HEALTH ap=%u samples=%lu missed=%lu raw=%u heap=%u oled=%u oled_mode=%u bpm=%.1f valid=%u\n",
                   WiFi.softAPgetStationNum(), static_cast<unsigned long>(state.samples),
-                  static_cast<unsigned long>(state.missed), state.raw, ESP.getFreeHeap(),
+                  static_cast<unsigned long>(state.missed), state.raw,
+                  static_cast<unsigned>(ESP.getFreeHeap()),
                   oledReady, oledMode(state), state.bpmCurrent, state.bpmValid);
   }
   delay(1);
